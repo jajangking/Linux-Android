@@ -62,8 +62,12 @@ else
     verdict FAIL "make test -- see build/termux-test.log"
 fi
 cat "$build/termux-test.log" >> "$report"
-if grep -q 'SKIP' "$build/termux-test.log"; then
-    log "note: at least one test reported SKIP (seccomp user notification unavailable here)."
+# Attribute each SKIP to its source so the note never misleads.
+if grep -q 'seccomp user notification unavailable' "$build/termux-test.log"; then
+    log "note: rootbox/seccomp tests SKIPped (seccomp user notification unavailable here)."
+fi
+if grep -q 'host denies hard links' "$build/termux-test.log"; then
+    log "note: hard-link checks SKIPped (host denies link(2)); this is a platform limit, not a shim failure."
 fi
 
 section "Step 3: repro chroot() on a regular file (fixed in round 2)"
