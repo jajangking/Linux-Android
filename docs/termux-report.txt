@@ -1,0 +1,75 @@
+
+===== Environment =====
+date: Thu Oct  8 15:37:50 WIB 2026
+uname: Linux localhost 6.12.38-android16-5-gb575a0b6e647-ab14355190-4k #1 SMP PREEMPT Wed Oct 29 06:56:12 UTC 2025 aarch64 Android
+arch: aarch64
+PREFIX: /data/data/com.termux/files/usr
+TERMUX_VERSION: 0.119.0-beta.3
+uid (real, via id): 10496
+compiler: clang -> clang version 21.1.8
+make: GNU Make 4.4.1
+git HEAD: arena/a4c2b8db-linux-android @ b08452f
+Seccomp/NoNewPrivs of this shell:
+NoNewPrivs:	0
+Seccomp:	2
+
+===== Step 1: build =====
+make: Entering directory '/data/data/com.termux/files/home/Linux-Android'
+mkdir -p build
+clang  -O2 -g -std=gnu11 -Wall -Wextra -fPIC -shared -o build/librootshim.so src/rootshim.c -ldl 
+clang  -O2 -g -std=gnu11 -Wall -Wextra -fPIC -o build/rootbox src/seccomp_supervisor.c 
+clang  -O2 -g -std=gnu11 -Wall -Wextra -fPIC -o build/rootshim-probe tests/rootshim_probe.c 
+make: Leaving directory '/data/data/com.termux/files/home/Linux-Android'
+[PASS] make all (CC=clang)
+
+===== Step 2: make test (smoke tests) =====
+[FAIL] make test -- see build/termux-test.log
+make: Entering directory '/data/data/com.termux/files/home/Linux-Android'
+sh tests/test-rootshim.sh
+cwd=/ uid=0 gid=0 st_uid=0 marker=from-rootfs
+rootshim smoke test: PASS
+sh tests/test-supervisor.sh
+0
+seccomp supervisor smoke test: PASS
+sh tests/test-rootbox-combined.sh
+sh: 1: id: not found
+cwd=/ uid= marker=from-rootfs
+make: *** [Makefile:25: test] Error 1
+make: Leaving directory '/data/data/com.termux/files/home/Linux-Android'
+
+===== Step 3: repro chroot() on a regular file (known bug) =====
+chroot(/afile) rc=-1 errno=Not a directory
+open(/etc/marker) after failed chroot: fd=-1 errno=Not a directory
+[KNOWN-BUG] failed chroot() corrupts virtual root (rootshim.c chroot)
+
+===== Step 4: repro getgroups() under rootbox (known bug) =====
+getgroups n=0
+egid=0
+[KNOWN-BUG] getgroups() returns 0 groups while getegid()==0 (seccomp_supervisor.c)
+
+===== Step 5: Termux probe (tools/probe-termux.sh) =====
+[PASS] probe-termux.sh ran to completion
+== Termux / Android probe ==
+uname: Linux localhost 6.12.38-android16-5-gb575a0b6e647-ab14355190-4k #1 SMP PREEMPT Wed Oct 29 06:56:12 UTC 2025 aarch64 Android
+PREFIX: /data/data/com.termux/files/usr
+TERMUX_VERSION: 0.119.0-beta.3
+architecture: aarch64
+user.max_user_namespaces: not readable/available
+NoNewPrivs:	0
+Seccomp:	2
+checking unprivileged user namespace...
+unshare: unavailable (exit 1): unshare: unshare failed: Invalid argument
+building native probes...
+make: Entering directory '/data/data/com.termux/files/home/Linux-Android'
+make: Nothing to be done for 'all'.
+make: Leaving directory '/data/data/com.termux/files/home/Linux-Android'
+checking seccomp user-notification supervisor...
+uid=0(root) gid=0(root) groups=0(root) context=u:r:untrusted_app_27:s0:c240,c257,c512,c768
+seccomp-child-ran
+seccomp supervisor child exit: 0
+probe complete
+
+===== Summary =====
+PASS=2 FAIL=1 KNOWN-BUG=2 SKIP=0 ERROR=0
+Report: /data/data/com.termux/files/home/Linux-Android/build/termux-report.txt
+Attach this file (build/termux-report.txt) when handing results back.
