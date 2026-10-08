@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/xattr.h>
 #include <time.h>
@@ -71,15 +72,50 @@ int main(void)
     CHECK(readlink(DIR_V "/l2", buf, sizeof buf - 1) == 1, "readlink");
     CHECK(unlink(DIR_V "/l2") == 0, "unlink");
 
-    CHECK(linkat(AT_FDCWD, DIR_V "/f", AT_FDCWD, DIR_V "/h", 0) == 0, "linkat");
-    CHECK(link(DIR_V "/h", DIR_V "/h1") == 0, "link");
-    CHECK(renameat(AT_FDCWD, DIR_V "/h", AT_FDCWD, DIR_V "/h2") == 0, "renameat");
-    CHECK(rename(DIR_V "/h2", DIR_V "/h3") == 0, "rename");
-    CHECK(unlinkat(AT_FDCWD, DIR_V "/h3", 0) == 0, "unlinkat");
-    CHECK(unlink(DIR_V "/h1") == 0, "unlink (hard link)");
+    /* Hard links: Android denies link(2) to app processes on some devices
+       (observed on Termux arm64, with no shim loaded). The host probe in
+       test-rootshim-hooks.sh sets RSH_HARDLINK_SUPPORTED; when the host itself
+       denies links, these checks are reported as SKIP, not as shim failures. */
+    const char *hl = getenv("RSH_HARDLINK_SUPPORTED");
+    int hardlinks = !(hl && strcmp(hl, "0") == 0);
+    if (hardlinks) {
+        CHECK(linkat(AT_FDCWD, DIR_V "/f", AT_FDCWD, DIR_V "/h", 0) == 0, "linkat");
+        CHECK(link(DIR_V "/h", DIR_V "/h1") == 0, "link");
+        CHECK(unlink(DIR_V "/h1") == 0, "unlink (hard link)");
+        CHECK(unlink(DIR_V "/h") == 0, "unlink (hard link 2)");
+    } else {
+        printf("skip  linkat/link (host denies hard links; not a shim failure)\n");
+    }
+
+    /* rename/unlink use their own file so they do not depend on hard links. */
+    fd = openat(AT_FDCWD, DIR_V "/r", O_CREAT | O_WRONLY, 0644);
+    CHECK(fd >= 0, "create file for rename checks");
+    if (fd >= 0)
+        close(fd);
+    CHECK(renameat(AT_FDCWD, DIR_V "/r", AT_FDCWD, DIR_V "/r2") == 0, "renameat");
+    CHECK(rename(DIR_V "/r2", DIR_V "/r3") == 0, "rename");
+    CHECK(unlinkat(AT_FDCWD, DIR_V "/r3", 0) == 0, "unlinkat");
 
 #if defined(__GLIBC__)
     CHECK(renameat2(AT_FDCWD, DIR_V "/f", AT_FDCWD, DIR_V "/f", 0) == 0, "renameat2");
+#endif
+
+    /* Raw syscall(): programs (and gnulib fallbacks) that call syscall()
+       directly must be mapped too. This is what made coreutils mv leak. */
+#ifdef SYS_renameat2
+    fd = openat(AT_FDCWD, DIR_V "/rs", O_CREAT | O_WRONLY, 0644);
+    if (fd >= 0)
+        close(fd);
+    CHECK(syscall(SYS_renameat2, AT_FDCWD, DIR_V "/rs", AT_FDCWD, DIR_V "/rs2", 0) == 0,
+          "raw syscall(SYS_renameat2) absolute path");
+    CHECK(syscall(SYS_unlinkat, AT_FDCWD, DIR_V "/rs2", 0) == 0,
+          "raw syscall(SYS_unlinkat) absolute path");
+#endif
+#ifdef SYS_openat
+    fd = (int)syscall(SYS_openat, AT_FDCWD, "/etc/marker", O_RDONLY, 0);
+    CHECK(fd >= 0, "raw syscall(SYS_openat) absolute path");
+    if (fd >= 0)
+        close(fd);
 #endif
 
     CHECK(faccessat(AT_FDCWD, DIR_V "/f", F_OK, 0) == 0, "faccessat");
@@ -116,6 +152,29 @@ int main(void)
     }
 
     if (fake) {
+#ifdef SYS_getuid
+        CHECK(syscall(SYS_getuid) == 0 && syscall(SYS_getgid) == 0,
+              "raw syscall(SYS_getuid/SYS_getgid) synthetic 0");
+#endif
+#ifdef SYS_newfstatat
+        {
+            struct stat rst;
+            long rrc = syscall(SYS_newfstatat, AT_FDCWD, DIR_V "/f", &rst, 0);
+            CHECK(rrc == 0 && rst.st_uid == 0 && rst.st_gid == 0,
+                  "raw syscall(SYS_newfstatat) synthetic owner");
+        }
+#endif
+#ifdef SYS_statx
+        {
+            unsigned char sxbuf[256];
+            long rrc = syscall(SYS_statx, AT_FDCWD, DIR_V "/f", 0, 0x7ff, sxbuf);
+            unsigned int uid = 0, gid = 1;
+            memcpy(&uid, sxbuf + 20, sizeof uid);
+            memcpy(&gid, sxbuf + 24, sizeof gid);
+            CHECK(rrc == 0 && uid == 0 && gid == 0,
+                  "raw syscall(SYS_statx) synthetic owner");
+        }
+#endif
         gid_t groups[8];
         int n = getgroups(8, groups);
         CHECK(getuid() == 0 && geteuid() == 0 && getgid() == 0 && getegid() == 0,

@@ -9,8 +9,23 @@ root="$tmp/rootfs"
 mkdir -p "$root/etc"
 printf 'from-rootfs\n' > "$root/etc/marker"
 
+# Probe hard-link support on the HOST, without any shim loaded. Some Android
+# devices deny link(2) to app processes; that is a platform limit, not a shim
+# failure, so the C test reports those checks as SKIP when the host denies it.
+probe="$tmp/hardlink-probe"
+mkdir -p "$probe"
+: > "$probe/a"
+if ln "$probe/a" "$probe/b" 2>/dev/null; then
+    hardlinks=1
+    echo 'host hard links: supported'
+else
+    hardlinks=0
+    echo 'host hard links: denied by host (checks will be SKIP)'
+fi
+
 set +e
-output=$(ROOTSHIM_ROOT="$root" ROOTSHIM_FAKE_ID=1 \
+output=$(RSH_HARDLINK_SUPPORTED="$hardlinks" \
+    ROOTSHIM_ROOT="$root" ROOTSHIM_FAKE_ID=1 \
     LD_PRELOAD="$repo/build/librootshim.so" \
     "$repo/build/rootshim-hooks" 2>&1)
 status=$?

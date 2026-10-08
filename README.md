@@ -9,10 +9,11 @@ Eksperimen untuk menjalankan **sebagian program Linux user-space** dari Termux t
 - `build/librootshim.so`: shim eksperimental yang memetakan path absolut ke `ROOTSHIM_ROOT`, memvirtualkan UID/GID/groups, menjadikan `chown` no-op, dan menyediakan `chroot()` tiruan berbasis prefix.
   - **Path-taking calls** (plain dan `*at`): `open`/`open64`/`openat`/`openat64`, entry point fortify `__open_2`/`__openat_2` (dan varian `64`), `fopen`/`fopen64`, `opendir`, `stat`/`lstat`/`fstatat`/`stat64`/`lstat64`/`fstatat64`/`statx`, `access`/`faccessat`/`faccessat2`, `chdir`, `mkdir`/`mkdirat`, `unlink`/`unlinkat`/`rmdir`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat` (hanya lokasi link yang dipetakan; target disimpan apa adanya), `readlink`/`readlinkat`, `chmod`/`fchmodat`, `truncate`, `utimensat` (path `NULL` diteruskan), `getxattr`/`lgetxattr`/`setxattr`/`lsetxattr`/`listxattr`/`llistxattr`/`removexattr`/`lremovexattr`, `chown`/`lchown`/`fchownat` (no-op saat fake ID aktif).
   - **Identitas tiruan** (`ROOTSHIM_FAKE_ID=1`): `getuid`/`geteuid`/`getgid`/`getegid`/`getresuid`/`getresgid` mengembalikan 0; `getgroups` mengembalikan daftar `{0}`; `stat`/`fstat`/`statx` melaporkan pemilik 0.
-  - **`statx`** hanya dikompilasi jika header menyediakan `struct statx` (glibc, atau Bionic API ≥ 30). Termux pada API level lebih rendah tidak memakai hook ini.
+  - **`syscall()` (libc)** juga diintersep: panggilan `syscall(SYS_renameat2, …)` dan sejenisnya dipetakan dengan aturan yang sama seperti wrapper di atas. Ini menutup kebocoran `mv` di Termux: gnulib memanggil `renameat2` lewat `syscall()` saat libc tidak mendeklarasikannya (Bionic API 24). Intersepsi hanya berlaku untuk pemanggil yang lewat PLT; inline asm dan binary statis tidak tercakup.
+  - **`statx`**: wrapper `statx()` hanya dikompilasi jika header menyediakan `struct statx` (glibc, atau Bionic API ≥ 30). Termux dengan `__ANDROID_API__ = 24` tidak punya wrapper `statx` sama sekali, jadi program di Termux tidak dapat memanggilnya langsung; panggilan `statx` mentah tetap dipetakan lewat `syscall()`.
 - `build/rootbox`: supervisor proof-of-concept berbasis seccomp user notification. Ia **hanya** mengubah hasil query `getuid`/`geteuid`/`getgid`/`getegid` menjadi `0`, dan `getgroups` menjadi `{0}`. Ia **tidak** memberi kapabilitas root atau melakukan operasi kernel `mount`/`chroot`.
 - `build/rootshim-hooks`: probe regresi untuk seluruh hook di atas, dibangun dengan `_FORTIFY_SOURCE=2`.
-- `tests/`: smoke test dan regresi (lihat bagian "Build dan tes").
+- `tests/`: smoke test dan regresi (lihat bagian "Build dan tes"). Pemanggilan `syscall()` mentah diuji di `tests/rootshim_hooks.c`.
 - `tools/probe-termux.sh`: membangun dan menjalankan probe di Termux serta mencatat batasan kernel/aplikasi.
 - `tools/termux-check.sh`: menjalankan seluruh tes dan repro di Termux, lalu menulis `build/termux-report.txt`.
 - `docs/HANDOFF-termux.md`: instruksi verifikasi untuk agent lokal di Termux.
@@ -24,6 +25,10 @@ Path di luar `ROOTSHIM_ROOT` **tidak terlihat** bagi proses yang dipetakan. Kare
 - Rootfs sungguhan wajib memiliki `/bin` dan `/usr/bin` sendiri, serta `PATH=/bin:/usr/bin` (atau sesuai isi rootfs).
 - `PATH` host (mis. `/data/data/com.termux/files/usr/bin`) tidak bisa dipakai untuk mencari program di dalam rootfs. Shell di dalam shim akan gagal menemukan `id` dsb. kecuali tersedia di rootfs.
 - Tes di repo sengaja tidak bergantung pada PATH: program yang diuji dikompilasi, dan pemeriksaan shell hanya memakai builtin serta path absolut ke `sh`.
+
+## Hard link di Android
+
+Beberapa perangkat Android menolak `link(2)`/`linkat(2)` untuk proses aplikasi, bahkan tanpa shim (terukur di Termux arm64). Itu batas platform, bukan kesalahan shim. Karena itu `tests/test-rootshim-hooks.sh` memeriksa dulu dukungan hard link di host (tanpa shim). Jika host menolak, pemeriksaan `linkat`/`link` dilaporkan sebagai `skip`; pemeriksaan lain tetap wajib lulus. Pemeriksaan `rename`/`unlink` memakai file sendiri, sehingga tidak bergantung pada hard link.
 
 ## Keputusan: `execve` tidak dipetakan
 
@@ -118,6 +123,6 @@ OpenCode dan CLI yang tersedia sebagai paket Termux sebaiknya dijalankan native 
 - Jangan gunakan ini sebagai sandbox keamanan. Path translation berbasis `LD_PRELOAD` dapat dilewati oleh syscall langsung, executable statis/setuid, `execve` (tidak di-hook), proses yang membersihkan environment, dan symlink/path traversal yang belum ditangani. Symlink dengan target absolut tetap diselesaikan oleh kernel terhadap root host.
 - Pemetaan lexical: path virtual yang diawali persis dengan path host rootfs (mis. `/data/.../rootfs/etc/x`) dibiarkan apa adanya dan **tidak** dipetakan ulang.
 - Program tetap hanya memiliki izin Android/Termux biasa. `chown` yang tampak sukses tidak mengubah owner kernel; `uid=0` tiruan tidak dapat memasang filesystem atau mengakses perangkat yang dilarang Android. `/proc/self/status` dan `stat` lewat syscall yang tidak di-hook masih menampilkan UID/GID asli.
-- Syscall yang tidak di-hook (mis. `execve`, `readdir` berbasis `getdents` langsung, `realpath` internal glibc) tidak tercakup pemetaan.
+- Syscall yang tidak di-hook (mis. `execve`, `getdents` langsung, `realpath` internal glibc) tidak tercakup pemetaan. Syscall mentah yang dipanggil lewat `syscall()` dari libc dipetakan untuk daftar path-argument yang dikenal; inline asm (`svc`) dan binary statis tidak.
 - Seccomp user notification bergantung pada dukungan kernel **dan** kebijakan seccomp/SELinux aplikasi. ADB biasa tidak dapat menambahkan dukungan yang tidak ada. Pengisian daftar grup di jalur seccomp juga bergantung pada `process_vm_writev`, yang bisa ditolak kebijakan ptrace.
 - “Debian lengkap” dalam arti boot init/systemd atau mendapatkan hak kernel root tidak dapat dijanjikan pada batasan ini. Fokus eksperimen adalah CLI yang kooperatif dan dapat berjalan sebagai user-space process.
