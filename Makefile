@@ -37,6 +37,7 @@ test: all
 	sh tests/test-rootshim-hooks.sh
 	sh tests/test-supervisor-groups.sh
 	sh tests/test-coreutils-shim.sh
+	sh tests/test-debian-rootfs.sh
 
 clean:
 	rm -rf $(BUILD)

@@ -67,6 +67,7 @@ make test
 | `test-rootshim-hooks.sh` | Seluruh hook path-taking dan identitas, dibangun dengan fortify; semua hasil harus berada di rootfs |
 | `test-supervisor-groups.sh` | `getgroups()` di bawah rootbox mencakup grup 0 |
 | `test-coreutils-shim.sh` | `cat cp mv rm ln readlink ls stat dd head chmod truncate touch mkdir` di bawah shim; tidak ada kebocoran ke host |
+| `test-debian-rootfs.sh` | Rootfs Debian bookworm dibangun dari daftar file `dpkg` paket yang terpasang di host (tanpa jaringan); binary glibc-nya dijalankan di bawah shim. `SKIP` di host non-Debian. Batas yang ditemukan dicatat sebagai `KNOWN-LIMIT`, bukan `FAIL` |
 
 Tes rootbox akan menandai dirinya `SKIP` jika seccomp user notification tidak tersedia di lingkungan tempat tes dijalankan.
 
@@ -113,6 +114,18 @@ ROOTSHIM_LIB="$PWD/build/librootshim.so" \
 Supervisor memasang `LD_PRELOAD` hanya pada proses anak. Untuk program Debian/glibc, shim juga harus dibangun dengan ABI glibc yang sesuai; jangan preload library Bionic Termux ke proses glibc.
 
 ## Status target Debian dan OpenCode
+
+### Hasil uji rootfs Debian (`test-debian-rootfs.sh`)
+
+Tes ini memakai coreutils, bash, dash, dan libc6 Debian 12 yang sebenarnya, di host x86_64 Debian 12. Yang sudah terbukti: `cp`, `mv` (termasuk jalur `renameat2` wrapper glibc), `ln`, `readlink`, `ls`, `rm`, `stat -c %u` (jalur statx glibc, pemilik tiruan), `id -u`, dan builtin dash, semuanya di bawah shim dan terbatas pada rootfs.
+
+Batas yang terukur dan **tidak** diperbaiki di shim:
+
+- **Loader dan libc dari host.** Jika binary dijalankan dengan path host-nya, kernel memuat ELF interpreter host, dan `ld.so` membuka libc host lewat pemanggilan internal yang tidak bisa dicegat `LD_PRELOAD`. Jika loader dipanggil langsung dari rootfs (`$ROOTFS/lib64/ld-linux-x86-64.so.2 --library-path ...`), libc dan library dimuat dari rootfs.
+- **NSS membaca `/etc/passwd` host.** `libnss_files` tidak mengimpor `fopen` atau `open`; ia memakai open internal glibc. Akibatnya `getent passwd root` di rootfs mengembalikan entri host. Ini tetap berlaku di kedua mode loader.
+- **`execve` path virtual tidak dipetakan** (lihat keputusan di atas).
+
+Untuk menutup dua batas pertama tanpa mengubah host, pilihannya adalah menjalankan semua binary lewat loader rootfs (mengubah cara `rootbox`/`rootbox-run.sh` memanggil program) atau meneruskan `openat` ke supervisor seccomp. Keduanya belum dikerjakan dan memerlukan keputusan terpisah.
 
 Target akhir berupa rootfs Debian ARM64 yang sudah diekstrak di penyimpanan privat Termux. Untuk menjalankannya dibutuhkan pekerjaan tambahan: pemanggilan glibc loader dari rootfs, kompatibilitas `PT_INTERP`/shebang, lookup `execve` yang rootfs-aware (lihat keputusan di atas), ownership virtual yang konsisten, serta uji tiap paket. Shim Bionic Termux **tidak** bisa langsung di-preload ke program glibc; shim harus dibangun untuk ABI glibc yang sama dengan program Debian.
 
