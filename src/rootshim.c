@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -11,13 +12,22 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/xattr.h>
+#include <time.h>
 #include <unistd.h>
-#include <dirent.h>
 
 /*
  * Experimental, cooperative-process shim. This is NOT a security boundary
  * and does not grant kernel privileges. It redirects a subset of libc path
  * calls into ROOTSHIM_ROOT and can report synthetic uid/gid values.
+ *
+ * Path-taking calls are hooked in both their plain and *at forms, plus the
+ * glibc/Bionic _FORTIFY_SOURCE entry points (__open_2 & co.), which GNU
+ * binaries import instead of open()/openat() when built with fortify.
+ *
+ * Deliberately NOT hooked: execve()/exec*(). Host binaries are found through
+ * the host PATH and must stay executable from inside the virtual root; see
+ * README.md "Batas keamanan dan kompatibilitas".
  */
 
 static char root_dir[PATH_MAX];
@@ -60,13 +70,24 @@ static bool already_rooted(const char *path)
     return path[root_len] == '\0' || path[root_len] == '/';
 }
 
+/* free() that does not clobber the errno of the wrapped call. */
+static void release(char *p)
+{
+    int saved = errno;
+    free(p);
+    errno = saved;
+}
+
 /* Map an absolute virtual path into ROOTSHIM_ROOT. Dot-dot components are
    clamped at the virtual root. This lexical mapping does not prevent symlink
-   escapes; see the security notes in README.md. */
+   escapes; see the security notes in README.md. Returns NULL with errno set
+   on failure; the caller must release() the result. */
 static char *map_path(const char *path)
 {
-    if (!path)
+    if (!path) {
+        errno = EFAULT;
         return NULL;
+    }
     if (!root_len || path[0] != '/' || is_passthrough(path) ||
         already_rooted(path))
         return strdup(path);
@@ -144,6 +165,8 @@ static void fake_stat_owner(struct stat *st)
     }
 }
 
+/* ---- identity ----------------------------------------------------------- */
+
 uid_t getuid(void)  { return fake_identity ? 0 : (uid_t)syscall(SYS_getuid); }
 uid_t geteuid(void) { return fake_identity ? 0 : (uid_t)syscall(SYS_geteuid); }
 gid_t getgid(void)  { return fake_identity ? 0 : (gid_t)syscall(SYS_getgid); }
@@ -169,100 +192,126 @@ int getresgid(gid_t *rgid, gid_t *egid, gid_t *sgid)
     return 0;
 }
 
+/* Synthetic supplementary groups: the single group 0, matching getegid(). */
+int getgroups(int size, gid_t list[])
+{
+    if (!fake_identity)
+        return (int)syscall(SYS_getgroups, size, list);
+    if (size < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (size == 0)
+        return 1;
+    if (!list) {
+        errno = EFAULT;
+        return -1;
+    }
+    list[0] = 0;
+    return 1;
+}
+
+/* ---- open family ---------------------------------------------------------- */
+
+typedef int (*openat_fn)(int, const char *, int, ...);
+
+static bool open_needs_mode(int flags)
+{
+    if (flags & O_CREAT)
+        return true;
+#ifdef O_TMPFILE
+    if ((flags & O_TMPFILE) == O_TMPFILE)
+        return true;
+#endif
+    return false;
+}
+
+static int do_openat(int dirfd, const char *path, int flags, mode_t mode)
+{
+    char *mapped = map_path(path);
+    if (!mapped)
+        return -1;
+    static openat_fn next_fn;
+    LOAD_NEXT(next_fn, "openat");
+    int rc;
+    if (next_fn)
+        rc = open_needs_mode(flags) ? next_fn(dirfd, mapped, flags, mode)
+                                    : next_fn(dirfd, mapped, flags);
+    else
+        rc = (int)syscall(SYS_openat, dirfd, mapped, flags, mode);
+    release(mapped);
+    return rc;
+}
+
 int open(const char *path, int flags, ...)
 {
     mode_t mode = 0;
-    if (flags & O_CREAT) {
+    if (open_needs_mode(flags)) {
         va_list ap;
         va_start(ap, flags);
         mode = (mode_t)va_arg(ap, int);
         va_end(ap);
     }
-    char *mapped = map_path(path);
-    if (!mapped)
-        return -1;
-    typedef int (*fn_t)(const char *, int, ...);
-    static fn_t next_fn;
-    LOAD_NEXT(next_fn, "open");
-    int rc;
-    if (next_fn)
-        rc = (flags & O_CREAT) ? next_fn(mapped, flags, mode) : next_fn(mapped, flags);
-    else
-        rc = (int)syscall(SYS_openat, AT_FDCWD, mapped, flags, mode);
-    free(mapped);
-    return rc;
+    return do_openat(AT_FDCWD, path, flags, mode);
 }
 
 int open64(const char *path, int flags, ...)
 {
     mode_t mode = 0;
-    if (flags & O_CREAT) {
+    if (open_needs_mode(flags)) {
         va_list ap;
         va_start(ap, flags);
         mode = (mode_t)va_arg(ap, int);
         va_end(ap);
     }
-    char *mapped = map_path(path);
-    if (!mapped)
-        return -1;
-    typedef int (*fn_t)(const char *, int, ...);
-    static fn_t next_fn;
-    LOAD_NEXT(next_fn, "open64");
-    int rc;
-    if (next_fn)
-        rc = (flags & O_CREAT) ? next_fn(mapped, flags, mode) : next_fn(mapped, flags);
-    else
-        rc = (int)syscall(SYS_openat, AT_FDCWD, mapped, flags, mode);
-    free(mapped);
-    return rc;
+    return do_openat(AT_FDCWD, path, flags, mode);
 }
 
 int openat(int dirfd, const char *path, int flags, ...)
 {
     mode_t mode = 0;
-    if (flags & O_CREAT) {
+    if (open_needs_mode(flags)) {
         va_list ap;
         va_start(ap, flags);
         mode = (mode_t)va_arg(ap, int);
         va_end(ap);
     }
-    char *mapped = map_path(path);
-    if (!mapped)
-        return -1;
-    typedef int (*fn_t)(int, const char *, int, ...);
-    static fn_t next_fn;
-    LOAD_NEXT(next_fn, "openat");
-    int rc;
-    if (next_fn)
-        rc = (flags & O_CREAT) ? next_fn(dirfd, mapped, flags, mode) : next_fn(dirfd, mapped, flags);
-    else
-        rc = (int)syscall(SYS_openat, dirfd, mapped, flags, mode);
-    free(mapped);
-    return rc;
+    return do_openat(dirfd, path, flags, mode);
 }
 
 int openat64(int dirfd, const char *path, int flags, ...)
 {
     mode_t mode = 0;
-    if (flags & O_CREAT) {
+    if (open_needs_mode(flags)) {
         va_list ap;
         va_start(ap, flags);
         mode = (mode_t)va_arg(ap, int);
         va_end(ap);
     }
-    char *mapped = map_path(path);
-    if (!mapped)
-        return -1;
-    typedef int (*fn_t)(int, const char *, int, ...);
-    static fn_t next_fn;
-    LOAD_NEXT(next_fn, "openat64");
-    int rc;
-    if (next_fn)
-        rc = (flags & O_CREAT) ? next_fn(dirfd, mapped, flags, mode) : next_fn(dirfd, mapped, flags);
-    else
-        rc = (int)syscall(SYS_openat, dirfd, mapped, flags, mode);
-    free(mapped);
-    return rc;
+    return do_openat(dirfd, path, flags, mode);
+}
+
+/* _FORTIFY_SOURCE entry points: the compiler emits these instead of
+   open()/openat() when flags are constant and no mode is needed. They take
+   no mode argument, so mode 0 is passed through. */
+int __open_2(const char *path, int flags)
+{
+    return do_openat(AT_FDCWD, path, flags, 0);
+}
+
+int __open64_2(const char *path, int flags)
+{
+    return do_openat(AT_FDCWD, path, flags, 0);
+}
+
+int __openat_2(int dirfd, const char *path, int flags)
+{
+    return do_openat(dirfd, path, flags, 0);
+}
+
+int __openat64_2(int dirfd, const char *path, int flags)
+{
+    return do_openat(dirfd, path, flags, 0);
 }
 
 FILE *fopen(const char *path, const char *mode)
@@ -274,7 +323,7 @@ FILE *fopen(const char *path, const char *mode)
     static fn_t next_fn;
     LOAD_NEXT(next_fn, "fopen");
     FILE *rc = next_fn ? next_fn(mapped, mode) : NULL;
-    free(mapped);
+    release(mapped);
     return rc;
 }
 
@@ -286,43 +335,29 @@ FILE *fopen64(const char *path, const char *mode)
     typedef FILE *(*fn_t)(const char *, const char *);
     static fn_t next_fn;
     LOAD_NEXT(next_fn, "fopen64");
-    if (!next_fn) {
-        next_fn = dlsym(RTLD_NEXT, "fopen");
-    }
+    if (!next_fn)
+        LOAD_NEXT(next_fn, "fopen");
     FILE *rc = next_fn ? next_fn(mapped, mode) : NULL;
-    free(mapped);
+    release(mapped);
     return rc;
 }
 
-int stat(const char *path, struct stat *st)
+DIR *opendir(const char *path)
 {
     char *mapped = map_path(path);
     if (!mapped)
-        return -1;
-    typedef int (*fn_t)(const char *, struct stat *);
+        return NULL;
+    typedef DIR *(*fn_t)(const char *);
     static fn_t next_fn;
-    LOAD_NEXT(next_fn, "stat");
-    int rc = next_fn ? next_fn(mapped, st) : (int)syscall(SYS_newfstatat, AT_FDCWD, mapped, st, 0);
-    if (rc == 0) fake_stat_owner(st);
-    free(mapped);
+    LOAD_NEXT(next_fn, "opendir");
+    DIR *rc = next_fn ? next_fn(mapped) : NULL;
+    release(mapped);
     return rc;
 }
 
-int lstat(const char *path, struct stat *st)
-{
-    char *mapped = map_path(path);
-    if (!mapped)
-        return -1;
-    typedef int (*fn_t)(const char *, struct stat *);
-    static fn_t next_fn;
-    LOAD_NEXT(next_fn, "lstat");
-    int rc = next_fn ? next_fn(mapped, st) : (int)syscall(SYS_newfstatat, AT_FDCWD, mapped, st, AT_SYMLINK_NOFOLLOW);
-    if (rc == 0) fake_stat_owner(st);
-    free(mapped);
-    return rc;
-}
+/* ---- stat family ---------------------------------------------------------- */
 
-int fstatat(int dirfd, const char *path, struct stat *st, int flags)
+static int do_fstatat(int dirfd, const char *path, struct stat *st, int flags)
 {
     char *mapped = map_path(path);
     if (!mapped)
@@ -330,11 +365,47 @@ int fstatat(int dirfd, const char *path, struct stat *st, int flags)
     typedef int (*fn_t)(int, const char *, struct stat *, int);
     static fn_t next_fn;
     LOAD_NEXT(next_fn, "fstatat");
-    int rc = next_fn ? next_fn(dirfd, mapped, st, flags) : (int)syscall(SYS_newfstatat, dirfd, mapped, st, flags);
-    if (rc == 0) fake_stat_owner(st);
-    free(mapped);
+    int rc = next_fn ? next_fn(dirfd, mapped, st, flags)
+                     : (int)syscall(SYS_newfstatat, dirfd, mapped, st, flags);
+    if (rc == 0)
+        fake_stat_owner(st);
+    release(mapped);
     return rc;
 }
+
+int stat(const char *path, struct stat *st)
+{
+    return do_fstatat(AT_FDCWD, path, st, 0);
+}
+
+int lstat(const char *path, struct stat *st)
+{
+    return do_fstatat(AT_FDCWD, path, st, AT_SYMLINK_NOFOLLOW);
+}
+
+int fstatat(int dirfd, const char *path, struct stat *st, int flags)
+{
+    return do_fstatat(dirfd, path, st, flags);
+}
+
+/* The *64 variants share the layout of struct stat on LP64 targets (Termux
+   arm64, x86_64). Their symbols are not provided on 32-bit builds here. */
+#if __SIZEOF_POINTER__ == 8
+int stat64(const char *path, struct stat64 *st)
+{
+    return do_fstatat(AT_FDCWD, path, (struct stat *)st, 0);
+}
+
+int lstat64(const char *path, struct stat64 *st)
+{
+    return do_fstatat(AT_FDCWD, path, (struct stat *)st, AT_SYMLINK_NOFOLLOW);
+}
+
+int fstatat64(int dirfd, const char *path, struct stat64 *st, int flags)
+{
+    return do_fstatat(dirfd, path, (struct stat *)st, flags);
+}
+#endif
 
 int fstat(int fd, struct stat *st)
 {
@@ -342,22 +413,44 @@ int fstat(int fd, struct stat *st)
     static fn_t next_fn;
     LOAD_NEXT(next_fn, "fstat");
     int rc = next_fn ? next_fn(fd, st) : (int)syscall(SYS_fstat, fd, st);
-    if (rc == 0) fake_stat_owner(st);
+    if (rc == 0)
+        fake_stat_owner(st);
     return rc;
 }
 
-int access(const char *path, int mode)
+#if __SIZEOF_POINTER__ == 8
+int fstat64(int fd, struct stat64 *st)
+{
+    return fstat(fd, (struct stat *)st);
+}
+#endif
+
+/* statx is only declared by glibc and by Bionic at API >= 30. Termux builds
+   at a lower API level, so the hook is compiled only where the header
+   provides struct statx. */
+#if defined(__GLIBC__) || (defined(__ANDROID_API__) && __ANDROID_API__ >= 30)
+#define ROOTSHIM_HAVE_STATX 1
+int statx(int dirfd, const char *path, int flags, unsigned int mask,
+          struct statx *buf)
 {
     char *mapped = map_path(path);
     if (!mapped)
         return -1;
-    typedef int (*fn_t)(const char *, int);
+    typedef int (*fn_t)(int, const char *, int, unsigned int, struct statx *);
     static fn_t next_fn;
-    LOAD_NEXT(next_fn, "access");
-    int rc = next_fn ? next_fn(mapped, mode) : (int)syscall(SYS_faccessat, AT_FDCWD, mapped, mode, 0);
-    free(mapped);
+    LOAD_NEXT(next_fn, "statx");
+    int rc = next_fn ? next_fn(dirfd, mapped, flags, mask, buf)
+                     : (int)syscall(SYS_statx, dirfd, mapped, flags, mask, buf);
+    if (rc == 0 && fake_identity) {
+        buf->stx_uid = 0;
+        buf->stx_gid = 0;
+    }
+    release(mapped);
     return rc;
 }
+#endif
+
+/* ---- access / cwd -------------------------------------------------------- */
 
 int faccessat(int dirfd, const char *path, int mode, int flags)
 {
@@ -367,9 +460,38 @@ int faccessat(int dirfd, const char *path, int mode, int flags)
     typedef int (*fn_t)(int, const char *, int, int);
     static fn_t next_fn;
     LOAD_NEXT(next_fn, "faccessat");
-    int rc = next_fn ? next_fn(dirfd, mapped, mode, flags) : (int)syscall(SYS_faccessat, dirfd, mapped, mode, flags);
-    free(mapped);
+    int rc = next_fn ? next_fn(dirfd, mapped, mode, flags)
+                     : (int)syscall(SYS_faccessat, dirfd, mapped, mode, flags);
+    release(mapped);
     return rc;
+}
+
+int faccessat2(int dirfd, const char *path, int mode, int flags)
+{
+    char *mapped = map_path(path);
+    if (!mapped)
+        return -1;
+    typedef int (*fn_t)(int, const char *, int, int);
+    static fn_t next_fn;
+    LOAD_NEXT(next_fn, "faccessat2");
+    int rc;
+    if (next_fn) {
+        rc = next_fn(dirfd, mapped, mode, flags);
+    } else {
+#ifdef SYS_faccessat2
+        rc = (int)syscall(SYS_faccessat2, dirfd, mapped, mode, flags);
+#else
+        errno = ENOSYS;
+        rc = -1;
+#endif
+    }
+    release(mapped);
+    return rc;
+}
+
+int access(const char *path, int mode)
+{
+    return faccessat(AT_FDCWD, path, mode, 0);
 }
 
 int chdir(const char *path)
@@ -381,7 +503,7 @@ int chdir(const char *path)
     static fn_t next_fn;
     LOAD_NEXT(next_fn, "chdir");
     int rc = next_fn ? next_fn(mapped) : (int)syscall(SYS_chdir, mapped);
-    free(mapped);
+    release(mapped);
     return rc;
 }
 
@@ -409,75 +531,336 @@ char *getcwd(char *buf, size_t size)
     return cwd;
 }
 
-int mkdir(const char *path, mode_t mode)
+/* ---- create / remove / rename / link ------------------------------------- */
+
+int mkdirat(int dirfd, const char *path, mode_t mode)
 {
     char *mapped = map_path(path);
     if (!mapped)
         return -1;
-    typedef int (*fn_t)(const char *, mode_t);
+    typedef int (*fn_t)(int, const char *, mode_t);
     static fn_t next_fn;
-    LOAD_NEXT(next_fn, "mkdir");
-    int rc = next_fn ? next_fn(mapped, mode) : (int)syscall(SYS_mkdirat, AT_FDCWD, mapped, mode);
-    free(mapped);
+    LOAD_NEXT(next_fn, "mkdirat");
+    int rc = next_fn ? next_fn(dirfd, mapped, mode)
+                     : (int)syscall(SYS_mkdirat, dirfd, mapped, mode);
+    release(mapped);
+    return rc;
+}
+
+int mkdir(const char *path, mode_t mode)
+{
+    return mkdirat(AT_FDCWD, path, mode);
+}
+
+int unlinkat(int dirfd, const char *path, int flags)
+{
+    char *mapped = map_path(path);
+    if (!mapped)
+        return -1;
+    typedef int (*fn_t)(int, const char *, int);
+    static fn_t next_fn;
+    LOAD_NEXT(next_fn, "unlinkat");
+    int rc = next_fn ? next_fn(dirfd, mapped, flags)
+                     : (int)syscall(SYS_unlinkat, dirfd, mapped, flags);
+    release(mapped);
     return rc;
 }
 
 int unlink(const char *path)
 {
-    char *mapped = map_path(path);
-    if (!mapped)
-        return -1;
-    typedef int (*fn_t)(const char *);
-    static fn_t next_fn;
-    LOAD_NEXT(next_fn, "unlink");
-    int rc = next_fn ? next_fn(mapped) : (int)syscall(SYS_unlinkat, AT_FDCWD, mapped, 0);
-    free(mapped);
-    return rc;
+    return unlinkat(AT_FDCWD, path, 0);
 }
 
 int rmdir(const char *path)
 {
-    char *mapped = map_path(path);
-    if (!mapped)
+    return unlinkat(AT_FDCWD, path, AT_REMOVEDIR);
+}
+
+int renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath)
+{
+    char *old_mapped = map_path(oldpath);
+    char *new_mapped = old_mapped ? map_path(newpath) : NULL;
+    if (!old_mapped || !new_mapped) {
+        release(old_mapped);
+        release(new_mapped);
         return -1;
-    typedef int (*fn_t)(const char *);
+    }
+    typedef int (*fn_t)(int, const char *, int, const char *);
     static fn_t next_fn;
-    LOAD_NEXT(next_fn, "rmdir");
-    int rc = next_fn ? next_fn(mapped) : (int)syscall(SYS_unlinkat, AT_FDCWD, mapped, AT_REMOVEDIR);
-    free(mapped);
+    LOAD_NEXT(next_fn, "renameat");
+    int rc = next_fn ? next_fn(olddirfd, old_mapped, newdirfd, new_mapped)
+                     : (int)syscall(SYS_renameat, olddirfd, old_mapped, newdirfd, new_mapped);
+    release(old_mapped);
+    release(new_mapped);
     return rc;
 }
 
 int rename(const char *oldpath, const char *newpath)
 {
+    return renameat(AT_FDCWD, oldpath, AT_FDCWD, newpath);
+}
+
+int renameat2(int olddirfd, const char *oldpath, int newdirfd,
+              const char *newpath, unsigned int flags)
+{
     char *old_mapped = map_path(oldpath);
-    char *new_mapped = map_path(newpath);
+    char *new_mapped = old_mapped ? map_path(newpath) : NULL;
     if (!old_mapped || !new_mapped) {
-        free(old_mapped);
-        free(new_mapped);
+        release(old_mapped);
+        release(new_mapped);
         return -1;
     }
-    typedef int (*fn_t)(const char *, const char *);
+    typedef int (*fn_t)(int, const char *, int, const char *, unsigned int);
     static fn_t next_fn;
-    LOAD_NEXT(next_fn, "rename");
-    int rc = next_fn ? next_fn(old_mapped, new_mapped) : (int)syscall(SYS_renameat, AT_FDCWD, old_mapped, AT_FDCWD, new_mapped);
-    free(old_mapped);
-    free(new_mapped);
+    LOAD_NEXT(next_fn, "renameat2");
+    int rc;
+    if (next_fn) {
+        rc = next_fn(olddirfd, old_mapped, newdirfd, new_mapped, flags);
+    } else {
+#ifdef SYS_renameat2
+        rc = (int)syscall(SYS_renameat2, olddirfd, old_mapped, newdirfd, new_mapped, flags);
+#else
+        errno = ENOSYS;
+        rc = -1;
+#endif
+    }
+    release(old_mapped);
+    release(new_mapped);
     return rc;
 }
 
-DIR *opendir(const char *path)
+int linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, int flags)
+{
+    char *old_mapped = map_path(oldpath);
+    char *new_mapped = old_mapped ? map_path(newpath) : NULL;
+    if (!old_mapped || !new_mapped) {
+        release(old_mapped);
+        release(new_mapped);
+        return -1;
+    }
+    typedef int (*fn_t)(int, const char *, int, const char *, int);
+    static fn_t next_fn;
+    LOAD_NEXT(next_fn, "linkat");
+    int rc = next_fn ? next_fn(olddirfd, old_mapped, newdirfd, new_mapped, flags)
+                     : (int)syscall(SYS_linkat, olddirfd, old_mapped, newdirfd, new_mapped, flags);
+    release(old_mapped);
+    release(new_mapped);
+    return rc;
+}
+
+int link(const char *oldpath, const char *newpath)
+{
+    return linkat(AT_FDCWD, oldpath, AT_FDCWD, newpath, 0);
+}
+
+/* The symlink *target* is stored verbatim (it is interpreted later, inside
+   the virtual root, as written); only the link location is mapped. */
+int symlinkat(const char *target, int newdirfd, const char *linkpath)
+{
+    char *mapped = map_path(linkpath);
+    if (!mapped)
+        return -1;
+    typedef int (*fn_t)(const char *, int, const char *);
+    static fn_t next_fn;
+    LOAD_NEXT(next_fn, "symlinkat");
+    int rc = next_fn ? next_fn(target, newdirfd, mapped)
+                     : (int)syscall(SYS_symlinkat, target, newdirfd, mapped);
+    release(mapped);
+    return rc;
+}
+
+int symlink(const char *target, const char *linkpath)
+{
+    return symlinkat(target, AT_FDCWD, linkpath);
+}
+
+ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz)
 {
     char *mapped = map_path(path);
     if (!mapped)
-        return NULL;
-    typedef DIR *(*fn_t)(const char *);
+        return -1;
+    typedef ssize_t (*fn_t)(int, const char *, char *, size_t);
     static fn_t next_fn;
-    LOAD_NEXT(next_fn, "opendir");
-    DIR *rc = next_fn ? next_fn(mapped) : NULL;
-    free(mapped);
+    LOAD_NEXT(next_fn, "readlinkat");
+    ssize_t rc = next_fn ? next_fn(dirfd, mapped, buf, bufsiz)
+                         : (ssize_t)syscall(SYS_readlinkat, dirfd, mapped, buf, bufsiz);
+    release(mapped);
     return rc;
 }
+
+ssize_t readlink(const char *path, char *buf, size_t bufsiz)
+{
+    return readlinkat(AT_FDCWD, path, buf, bufsiz);
+}
+
+/* ---- mode, size, times, xattrs ------------------------------------------- */
+
+int fchmodat(int dirfd, const char *path, mode_t mode, int flags)
+{
+    char *mapped = map_path(path);
+    if (!mapped)
+        return -1;
+    typedef int (*fn_t)(int, const char *, mode_t, int);
+    static fn_t next_fn;
+    LOAD_NEXT(next_fn, "fchmodat");
+    int rc = next_fn ? next_fn(dirfd, mapped, mode, flags)
+                     : (int)syscall(SYS_fchmodat, dirfd, mapped, mode, flags);
+    release(mapped);
+    return rc;
+}
+
+int chmod(const char *path, mode_t mode)
+{
+    return fchmodat(AT_FDCWD, path, mode, 0);
+}
+
+int truncate(const char *path, off_t length)
+{
+    char *mapped = map_path(path);
+    if (!mapped)
+        return -1;
+    typedef int (*fn_t)(const char *, off_t);
+    static fn_t next_fn;
+    LOAD_NEXT(next_fn, "truncate");
+    int rc = next_fn ? next_fn(mapped, length)
+                     : (int)syscall(SYS_truncate, mapped, length);
+    release(mapped);
+    return rc;
+}
+
+/* utimensat(dirfd, NULL, ...) is valid (acts on dirfd itself): pass through. */
+int utimensat(int dirfd, const char *path, const struct timespec times[2], int flags)
+{
+    char *mapped = NULL;
+    const char *p = path; /* copy: NULL is a valid argument here */
+    if (p) {
+        mapped = map_path(p);
+        if (!mapped)
+            return -1;
+    }
+    typedef int (*fn_t)(int, const char *, const struct timespec *, int);
+    static fn_t next_fn;
+    LOAD_NEXT(next_fn, "utimensat");
+    const char *target = mapped ? mapped : path;
+    int rc = next_fn ? next_fn(dirfd, target, times, flags)
+                     : (int)syscall(SYS_utimensat, dirfd, target, times, flags);
+    release(mapped);
+    return rc;
+}
+
+ssize_t getxattr(const char *path, const char *name, void *value, size_t size)
+{
+    char *mapped = map_path(path);
+    if (!mapped)
+        return -1;
+    typedef ssize_t (*fn_t)(const char *, const char *, void *, size_t);
+    static fn_t next_fn;
+    LOAD_NEXT(next_fn, "getxattr");
+    ssize_t rc = next_fn ? next_fn(mapped, name, value, size)
+                         : (ssize_t)syscall(SYS_getxattr, mapped, name, value, size);
+    release(mapped);
+    return rc;
+}
+
+ssize_t lgetxattr(const char *path, const char *name, void *value, size_t size)
+{
+    char *mapped = map_path(path);
+    if (!mapped)
+        return -1;
+    typedef ssize_t (*fn_t)(const char *, const char *, void *, size_t);
+    static fn_t next_fn;
+    LOAD_NEXT(next_fn, "lgetxattr");
+    ssize_t rc = next_fn ? next_fn(mapped, name, value, size)
+                         : (ssize_t)syscall(SYS_lgetxattr, mapped, name, value, size);
+    release(mapped);
+    return rc;
+}
+
+int setxattr(const char *path, const char *name, const void *value, size_t size, int flags)
+{
+    char *mapped = map_path(path);
+    if (!mapped)
+        return -1;
+    typedef int (*fn_t)(const char *, const char *, const void *, size_t, int);
+    static fn_t next_fn;
+    LOAD_NEXT(next_fn, "setxattr");
+    int rc = next_fn ? next_fn(mapped, name, value, size, flags)
+                     : (int)syscall(SYS_setxattr, mapped, name, value, size, flags);
+    release(mapped);
+    return rc;
+}
+
+int lsetxattr(const char *path, const char *name, const void *value, size_t size, int flags)
+{
+    char *mapped = map_path(path);
+    if (!mapped)
+        return -1;
+    typedef int (*fn_t)(const char *, const char *, const void *, size_t, int);
+    static fn_t next_fn;
+    LOAD_NEXT(next_fn, "lsetxattr");
+    int rc = next_fn ? next_fn(mapped, name, value, size, flags)
+                     : (int)syscall(SYS_lsetxattr, mapped, name, value, size, flags);
+    release(mapped);
+    return rc;
+}
+
+int removexattr(const char *path, const char *name)
+{
+    char *mapped = map_path(path);
+    if (!mapped)
+        return -1;
+    typedef int (*fn_t)(const char *, const char *);
+    static fn_t next_fn;
+    LOAD_NEXT(next_fn, "removexattr");
+    int rc = next_fn ? next_fn(mapped, name)
+                     : (int)syscall(SYS_removexattr, mapped, name);
+    release(mapped);
+    return rc;
+}
+
+int lremovexattr(const char *path, const char *name)
+{
+    char *mapped = map_path(path);
+    if (!mapped)
+        return -1;
+    typedef int (*fn_t)(const char *, const char *);
+    static fn_t next_fn;
+    LOAD_NEXT(next_fn, "lremovexattr");
+    int rc = next_fn ? next_fn(mapped, name)
+                     : (int)syscall(SYS_lremovexattr, mapped, name);
+    release(mapped);
+    return rc;
+}
+
+ssize_t listxattr(const char *path, char *list, size_t size)
+{
+    char *mapped = map_path(path);
+    if (!mapped)
+        return -1;
+    typedef ssize_t (*fn_t)(const char *, char *, size_t);
+    static fn_t next_fn;
+    LOAD_NEXT(next_fn, "listxattr");
+    ssize_t rc = next_fn ? next_fn(mapped, list, size)
+                         : (ssize_t)syscall(SYS_listxattr, mapped, list, size);
+    release(mapped);
+    return rc;
+}
+
+ssize_t llistxattr(const char *path, char *list, size_t size)
+{
+    char *mapped = map_path(path);
+    if (!mapped)
+        return -1;
+    typedef ssize_t (*fn_t)(const char *, char *, size_t);
+    static fn_t next_fn;
+    LOAD_NEXT(next_fn, "llistxattr");
+    ssize_t rc = next_fn ? next_fn(mapped, list, size)
+                         : (ssize_t)syscall(SYS_llistxattr, mapped, list, size);
+    release(mapped);
+    return rc;
+}
+
+/* ---- ownership (virtual) ------------------------------------------------- */
 
 int chown(const char *path, uid_t owner, gid_t group)
 {
@@ -489,8 +872,9 @@ int chown(const char *path, uid_t owner, gid_t group)
     typedef int (*fn_t)(const char *, uid_t, gid_t);
     static fn_t next_fn;
     LOAD_NEXT(next_fn, "chown");
-    int rc = next_fn ? next_fn(mapped, owner, group) : (int)syscall(SYS_fchownat, AT_FDCWD, mapped, owner, group, 0);
-    free(mapped);
+    int rc = next_fn ? next_fn(mapped, owner, group)
+                     : (int)syscall(SYS_fchownat, AT_FDCWD, mapped, owner, group, 0);
+    release(mapped);
     return rc;
 }
 
@@ -504,8 +888,9 @@ int lchown(const char *path, uid_t owner, gid_t group)
     typedef int (*fn_t)(const char *, uid_t, gid_t);
     static fn_t next_fn;
     LOAD_NEXT(next_fn, "lchown");
-    int rc = next_fn ? next_fn(mapped, owner, group) : (int)syscall(SYS_fchownat, AT_FDCWD, mapped, owner, group, AT_SYMLINK_NOFOLLOW);
-    free(mapped);
+    int rc = next_fn ? next_fn(mapped, owner, group)
+                     : (int)syscall(SYS_fchownat, AT_FDCWD, mapped, owner, group, AT_SYMLINK_NOFOLLOW);
+    release(mapped);
     return rc;
 }
 
@@ -529,35 +914,56 @@ int fchownat(int dirfd, const char *path, uid_t owner, gid_t group, int flags)
     typedef int (*fn_t)(int, const char *, uid_t, gid_t, int);
     static fn_t next_fn;
     LOAD_NEXT(next_fn, "fchownat");
-    int rc = next_fn ? next_fn(dirfd, mapped, owner, group, flags) : (int)syscall(SYS_fchownat, dirfd, mapped, owner, group, flags);
-    free(mapped);
+    int rc = next_fn ? next_fn(dirfd, mapped, owner, group, flags)
+                     : (int)syscall(SYS_fchownat, dirfd, mapped, owner, group, flags);
+    release(mapped);
     return rc;
 }
 
-/* Synthetic chroot: change the virtual root and process cwd, but never invoke
-   the privileged kernel chroot syscall. */
+/* ---- synthetic chroot ----------------------------------------------------- */
+
+/* Change the virtual root and process cwd, but never invoke the privileged
+   kernel chroot syscall. The new root must be an existing directory; the
+   virtual root is only replaced after every check and the chdir succeeded,
+   so a failed chroot() leaves the previous root fully in effect. */
 int chroot(const char *path)
 {
     if (!root_len)
         return (int)syscall(SYS_chroot, path);
+
     char *mapped = map_path(path);
     if (!mapped)
         return -1;
     char resolved[PATH_MAX];
     if (!realpath(mapped, resolved)) {
-        free(mapped);
+        release(mapped);
         return -1;
     }
-    free(mapped);
+    release(mapped);
+
+    /* Raw syscall: the path is already a host path and must not be mapped. */
+    struct stat st;
+    if (syscall(SYS_newfstatat, AT_FDCWD, resolved, &st, 0) != 0)
+        return -1;
+    if (!S_ISDIR(st.st_mode)) {
+        errno = ENOTDIR;
+        return -1;
+    }
+
     size_t n = strlen(resolved);
     if (n >= sizeof(root_dir)) {
         errno = ENAMETOOLONG;
         return -1;
     }
-    memcpy(root_dir, resolved, n + 1);
-    root_len = n;
+
     typedef int (*fn_t)(const char *);
     static fn_t next_chdir;
     LOAD_NEXT(next_chdir, "chdir");
-    return next_chdir ? next_chdir(root_dir) : (int)syscall(SYS_chdir, root_dir);
+    int rc = next_chdir ? next_chdir(resolved) : (int)syscall(SYS_chdir, resolved);
+    if (rc != 0)
+        return -1;
+
+    memcpy(root_dir, resolved, n + 1);
+    root_len = n;
+    return 0;
 }

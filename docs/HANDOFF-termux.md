@@ -1,108 +1,131 @@
-# Handoff: verifikasi di Termux (untuk agent lokal)
+# Handoff ronde 2: verifikasi di Termux (untuk agent lokal)
 
-Dokumen ini ditujukan untuk AI agent yang berjalan langsung di Termux (perangkat Android). Tugasmu: **menjalankan tes dan repro di Termux, lalu mengembalikan laporan**. Kamu **tidak** diminta mengubah kode.
+Dokumen ini ditujukan untuk AI agent yang berjalan langsung di Termux (perangkat Android). Tugasmu: **pull perbaikan terbaru, jalankan tes, dan kembalikan laporan**. Kamu **tidak** diminta mengubah kode.
 
-## 1. Konteks singkat
+## 1. Apa yang berubah sejak ronde 1
 
-- Repo: `jajangking/Linux-Android` — eksperimen menjalankan sebagian program Linux user-space di Termux tanpa root/PRoot memakai shim `LD_PRELOAD` (`src/rootshim.c`) dan supervisor seccomp (`src/seccomp_supervisor.c`).
-- Ini **bukan** sandbox keamanan dan `uid=0` yang tampil hanyalah nilai tiruan. Jangan menafsirkan hasil tes sebagai bukti keamanan.
-- Branch kerja: `arena/a4c2b8db-linux-android`.
-- Hasil review kode sebelumnya di Linux (x86_64) menemukan dua bug yang ingin kita konfirmasi di Termux (arm64, Bionic):
-  1. **chroot()** tiruan: `chroot()` ke file biasa (bukan direktori) mengubah virtual root sebelum error, sehingga pemetaan path rusak setelahnya. Repro: `tests/repro/chroot_file.c`.
-  2. **getgroups()** di bawah `rootbox`: `getegid()` mengembalikan `0`, tetapi `getgroups()` mengembalikan jumlah `0` (daftar kosong). Repro: `tests/repro/getgroups.c`.
+Balasan ronde 1 (`ARENA-REPLY.md`) menemukan bug dan temuan tambahan. Semuanya sudah diperbaiki di branch ini, dan sudah diverifikasi di x86 (Debian, gcc 12). **Verifikasi di Bionic/Termux belum dilakukan** — itulah tugasmu.
 
-## 2. Prasyarat di Termux
+| Temuan | Perbaikan | Yang perlu dicek di Termux |
+|---|---|---|
+| `chroot()` merusak virtual root saat gagal | Validasi `S_ISDIR`; state diubah hanya setelah `chdir` berhasil | `tests/repro/chroot_file.c` harus `PASS` |
+| `getgroups()` kosong di bawah rootbox | Supervisor membalas `{0}` dan menulis GID 0 ke buffer lewat `process_vm_writev`; shim juga meng-hook `getgroups` | **`repro-getgroups` harus `PASS`.** Jika `process_vm_writev` ditolak di perangkat ini, hasilnya `FAIL` exit 4 — laporkan apa adanya |
+| `__open_2`/`__openat_2` tidak di-hook (coreutils bocor) | Hook ditambahkan, termasuk varian `64` | `coreutils under shim` harus `PASS`; `rootshim-hooks` harus `PASS` |
+| Hook `*at`, `symlink`, `readlink`, `statx`, xattr, dll. belum ada | Ditambahkan (lihat README "Yang ada sekarang") | `rootshim-hooks` harus `PASS` |
+| `test-rootbox-combined.sh` gagal karena `id` tidak ditemukan | Tes diubah: memakai probe terkompilasi dan `sh` dengan path absolut | `make test` harus hijau |
+| Output `Seccomp`/`NoNewPrivs` di runner tidak tampil di terminal | Diperbaiki | — |
+
+Keputusan yang **sengaja tidak** diubah: `execve` tidak di-hook (lihat README, "Keputusan: execve tidak dipetakan"). Jangan menganggap ini regresi.
+
+## 2. Prasyarat
 
 ```sh
 pkg update
 pkg install -y git clang make
 ```
 
-Pastikan repo sudah tersedia dan berada di branch yang benar:
+## 3. Langkah
 
 ```sh
 cd ~/Linux-Android            # atau lokasi clone-mu
 git fetch origin
 git checkout arena/a4c2b8db-linux-android
 git pull --ff-only origin arena/a4c2b8db-linux-android
-git log --oneline -3          # HEAD harus memuat tools/termux-check.sh dan docs/HANDOFF-termux.md
-```
+git log --oneline -3          # HEAD harus memuat "round 2" / commit setelah d3bfe3d
 
-Jika `git` meminta autentikasi, jangan mencari atau menyimpan token sendiri; laporkan ke user bahwa akses git di Termux perlu diatur.
-
-## 3. Langkah utama (satu perintah)
-
-Dari root repo:
-
-```sh
+mkdir -p build
+make -B CC=clang all 2>&1 | tee build/round2-build.log
+make CC=clang test 2>&1 | tee build/round2-test.log
 sh tools/termux-check.sh
 echo "exit=$?"
 ```
 
-Skrip ini:
-1. Mencatat lingkungan (arsitektur, `PREFIX`, `TERMUX_VERSION`, compiler, status seccomp shell).
-2. Build ulang dengan `clang` (fallback `cc`) via `make -B all`.
-3. Menjalankan `make test` (tiga smoke test).
-4. Mereproduksi bug chroot() dan menandai `KNOWN-BUG` jika masih terjadi.
-5. Mereproduksi bug getgroups() di bawah `rootbox`, menandai `SKIP` jika seccomp user-notification tidak tersedia.
-6. Menjalankan `tools/probe-termux.sh` (cek `unshare`, seccomp, dan build probe).
+Catatan: jangan jalankan `make clean` sebelum langkah di atas; itu menghapus `build/` beserta log yang baru dibuat. Jika `make test` gagal, jalankan ulang bagian yang gagal saja dengan `make -B CC=clang test` agar log verbose tersimpan di `build/`.
 
-Hasil lengkap ditulis ke **`build/termux-report.txt`**. Log tiap langkah ada di `build/termux-*.log`. Direktori `build/` sudah di-ignore Git.
+Hasil lengkap ada di `build/termux-report.txt`. Log tiap langkah ada di `build/`.
 
 Arti status:
 
 | Status | Arti |
 |---|---|
 | `PASS` | Perilaku sesuai harapan |
-| `FAIL` | Regresi nyata — prioritas tinggi, sertakan log |
-| `KNOWN-BUG` | Bug yang sudah diketahui masih terjadi (bukan regresi baru) |
+| `FAIL` | Regresi atau bug yang masih ada — **prioritas tinggi**, sertakan log |
 | `SKIP` | Fitur kernel/Android tidak tersedia (mis. seccomp user-notification) |
 | `ERROR` | Skrip tidak bisa menjalankan langkah (mis. `clang`/`make` belum terpasang) |
 
-Catatan: `exit` non-zero bila ada `FAIL` atau `ERROR`. `KNOWN-BUG` dan `SKIP` **tidak** menyebabkan exit non-zero.
+`exit` non-zero bila ada `FAIL` atau `ERROR`.
 
-## 4. Yang harus dilakukan agent lokal
+## 4. Pemeriksaan tambahan (wajib, cepat)
 
-1. Jalankan `sh tools/termux-check.sh` dan biarkan selesai (bisa 1–3 menit).
-2. Jika ada `ERROR` karena paket hilang, pasang paket yang diminta (`pkg install -y clang make`), lalu ulangi langkah 1.
-3. Jika ada `FAIL`, jalankan ulang `make test` secara verbose dan simpan outputnya:
-   ```sh
-   make -B CC=clang test 2>&1 | tee build/termux-test-verbose.log
-   ```
-4. Jika `probe-termux.sh` mencetak `seccomp supervisor: unavailable`, catat itu apa adanya — jangan dianggap bug.
-5. Jangan mengedit file di `src/`, `tests/`, atau `tools/`. Jangan `commit`, `push`, atau membuat branch baru. Jangan jalankan `su`, `sudo`, atau `unshare` dengan `--map-root-user` untuk "memaksa" tes.
-6. Kembalikan `build/termux-report.txt` (dan log yang relevan) ke user.
+Jalankan ini dan sertakan hasilnya di laporan. Tidak ada yang mengubah repo.
 
-## 5. Format laporan balik
+```sh
+# a) Simbol yang diekspor shim (harus ada __open_2, statx hanya jika API>=30)
+nm -D build/librootshim.so | grep -E '__open(at)?(64)?_2|statx|getgroups|renameat2|faccessat2'
 
-Salin bagian ini dan isi. Lampirkan `build/termux-report.txt` lengkap.
+# b) Apakah coreutils Termux mengimpor entry point fortify? (informasi, bukan lulus/gagal)
+readelf --dyn-syms "$(command -v cat)" | grep -oE '__open(at)?(64)?_2' | sort -u
+
+# c) Peringatan kompilasi dari build clang (harus nol atau dicatat)
+grep -iE 'warning|error' build/round2-build.log build/round2-test.log || echo "no warnings"
+
+# d) Supervisor: getgroups di bawah rootbox
+build/rootbox -- build/repro-getgroups; echo "rc=$?"
+
+# e) Cek izin ptrace untuk process_vm_writev (diagnosis jika (d) gagal)
+cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo "yama: not present"
+```
+
+Jika `(d)` menghasilkan `rc=4`, jangan mencoba mengubah SELinux atau mencari root. Laporkan saja.
+
+## 5. Yang harus dilakukan agent lokal
+
+1. Pull branch, lalu jalankan langkah di bagian 3 dan 4.
+2. Jika ada `FAIL`, simpan output lengkapnya dan jalankan ulang bagian yang gagal dengan `make -B CC=clang test` untuk log verbose.
+3. Jika ada `ERROR` karena paket hilang, pasang paketnya (`pkg install -y clang make`), lalu ulangi.
+4. Catat `SKIP` apa adanya; jangan dianggap lulus.
+5. Jangan mengedit file di `src/`, `tests/`, `tools/`, `docs/`, atau `README.md`. Jangan `commit`, `push`, atau membuat branch baru. Jangan jalankan `su`, `sudo`, atau `unshare --map-root-user` untuk "memaksa" tes.
+6. Kembalikan laporan sesuai format di bagian 6, dan lampirkan `build/termux-report.txt`.
+
+## 6. Format laporan balik
+
+Salin template ini dan isi. Lampirkan `build/termux-report.txt` lengkap, serta log yang relevan jika ada `FAIL`.
 
 ```
-Handoff result — Termux verification
+Handoff round 2 — Termux verification
 Commit: <git rev-parse --short HEAD>
-Perangkat/Android: <uname -a, TERMUX_VERSION jika ada>
+Perangkat/Android: <uname -a; TERMUX_VERSION>
 Arsitektur: <uname -m>
 Compiler: <clang --version | head -1>
+Make: <make --version | head -1>
 
-Ringkasan: PASS=<n> FAIL=<n> KNOWN-BUG=<n> SKIP=<n> ERROR=<n>
+Ringkasan termux-check: PASS=<n> FAIL=<n> SKIP=<n> ERROR=<n>
 
-Temuan utama:
-- make all: <PASS/FAIL>
-- make test: <PASS/FAIL, sebutkan tes yang SKIP>
-- chroot() bug: <KNOWN-BUG / PASS / ...>
-- getgroups() bug: <KNOWN-BUG / PASS / SKIP / ...>
-- probe-termux: <ringkasan: unshare, seccomp, NoNewPrivs>
+Per langkah:
+- make all (clang, -Wall -Wextra): <PASS/FAIL; jumlah warning>
+- make test: <PASS/FAIL; sebutkan tes yang FAIL/SKIP>
+- chroot() repro: <PASS/FAIL>
+- getgroups() repro di rootbox: <PASS/FAIL/SKIP; rc>
+- coreutils di bawah shim: <PASS/FAIL; sebutkan tool yang gagal>
+- rootshim-hooks: <PASS/FAIL; sebutkan check yang FAIL>
+- probe-termux.sh: <ringkasan: unshare, seccomp, NoNewPrivs>
 
-Hal di luar dugaan (jika ada):
-<tulis apa adanya>
+Hasil pemeriksaan tambahan (bagian 4):
+a) simbol shim: <tempel>
+b) coreutils __open_2: <ya/tidak, sebutkan binary>
+c) warning: <jumlah/daftar>
+d) rootbox getgroups: <rc dan output>
+e) ptrace_scope: <nilai>
+
+Hal di luar dugaan:
+<tulis apa adanya, termasuk pertanyaan>
 
 Lampiran: build/termux-report.txt
 ```
 
-## 6. Jika ada hal yang tidak jelas
+## 7. Pertanyaan yang paling penting untuk dijawab
 
-Jangan menebak. Tulis pertanyaanmu di bagian "Hal di luar dugaan" dan sertakan output yang relevan. Pertanyaan yang paling berguna untuk kami:
-
-- Apakah `make test` menampilkan `SKIP` pada tes seccomp? (Jika ya, seccomp user-notification tidak aktif di perangkat ini.)
-- Apakah `getgroups()` di bawah `rootbox` mengembalikan daftar yang berisi `0` atau tetap kosong?
-- Apakah `rootshim-probe` menghasilkan `cwd=/ uid=0 gid=0 st_uid=0 marker=from-rootfs` di Bionic?
+- Apakah `repro-getgroups` lulus di rootbox pada perangkat ini (bagian 4d)? Ini satu-satunya check yang bergantung pada izin Android untuk `process_vm_writev`.
+- Apakah `rootshim-hooks` lulus di Bionic? Tes ini memakai `_FORTIFY_SOURCE=2`, jadi jalur `__open_2` benar-benar diuji.
+- Apakah `coreutils under shim` lulus? Sebelum perbaikan, `cat`, `cp`, `mv`, `rm`, `ln`, `ls`, `stat`, `dd`, `head` bocor ke host.
+- Apakah ada warning kompilasi dari deklarasi `statx`, `renameat2`, atau `faccessat2` di API level Termux?

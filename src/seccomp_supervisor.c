@@ -13,7 +13,9 @@
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <stdint.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <signal.h>
 #include <unistd.h>
@@ -23,6 +25,9 @@
 #endif
 #ifndef SECCOMP_FILTER_FLAG_NEW_LISTENER
 #define SECCOMP_FILTER_FLAG_NEW_LISTENER (1UL << 3)
+#endif
+#ifndef SECCOMP_IOCTL_NOTIF_ID_VALID
+#define SECCOMP_IOCTL_NOTIF_ID_VALID _IOW('!', 2, uint64_t)
 #endif
 #ifndef SECCOMP_IOCTL_NOTIF_RECV
 #define SECCOMP_IOCTL_NOTIF_RECV _IOWR('!', 0, struct seccomp_notif)
@@ -162,6 +167,49 @@ static int is_identity_query(int syscall_nr)
     return 0;
 }
 
+/* Is the notification still for a live, unchanged request? Guards against
+   the tracee having exited and its pid having been reused. */
+static int notification_still_valid(int listener, uint64_t id)
+{
+    return ioctl(listener, SECCOMP_IOCTL_NOTIF_ID_VALID, &id) == 0;
+}
+
+/* Write one gid_t (0) into the tracee's memory at addr. */
+static int write_gid_zero(pid_t pid, unsigned long addr)
+{
+    gid_t gid = 0;
+    struct iovec local = { .iov_base = &gid, .iov_len = sizeof(gid) };
+    struct iovec remote = { .iov_base = (void *)addr, .iov_len = sizeof(gid) };
+    ssize_t n = process_vm_writev(pid, &local, 1, &remote, 1, 0);
+    return n == (ssize_t)sizeof(gid) ? 0 : -1;
+}
+
+static void answer_getgroups(int listener, const struct seccomp_notif *request,
+                             struct seccomp_notif_resp *response)
+{
+    /* getgroups(int size, gid_t *list): size==0 queries the count only.
+       The synthetic set is exactly {0}, matching the faked getegid(). */
+    int size = (int)request->data.args[0];
+    unsigned long list = (unsigned long)request->data.args[1];
+    if (size < 0) {
+        response->error = -EINVAL;
+    } else if (size == 0) {
+        response->val = 1;
+    } else if (!list) {
+        response->error = -EFAULT;
+    } else if (!notification_still_valid(listener, request->id)) {
+        response->error = -ENOENT;
+    } else if (write_gid_zero(request->pid, list) != 0) {
+        /* process_vm_writev denied (ptrace policy). Report an error rather
+           than leave an uninitialised list behind. */
+        response->error = -EPERM;
+    } else if (!notification_still_valid(listener, request->id)) {
+        response->error = -ENOENT;
+    } else {
+        response->val = 1;
+    }
+}
+
 static int respond_to_notification(int listener)
 {
     struct seccomp_notif request;
@@ -171,7 +219,9 @@ static int respond_to_notification(int listener)
         return -1;
     memset(&response, 0, sizeof(response));
     response.id = request.id;
-    if (is_identity_query(request.data.nr)) {
+    if (request.data.nr == SYS_getgroups) {
+        answer_getgroups(listener, &request, &response);
+    } else if (is_identity_query(request.data.nr)) {
         /* This changes only the return value observed by the child. The child
            retains its real Android UID and receives no kernel capabilities. */
         response.val = 0;
@@ -193,6 +243,15 @@ static int supervise(int listener, pid_t child)
             kill(child, SIGKILL);
             waitpid(child, NULL, 0);
             return 125;
+        }
+        if (ready > 0 && (pfd.revents & (POLLHUP | POLLERR)) && !(pfd.revents & POLLIN)) {
+            /* No task still holds the filter: the child has exited. Reap it
+               instead of spinning on the hung-up listener. */
+            if (waitpid(child, &child_status, 0) < 0) {
+                perror("rootbox: waitpid");
+                return 125;
+            }
+            break;
         }
         if (ready > 0 && (pfd.revents & POLLIN)) {
             if (respond_to_notification(listener) != 0 && errno != ENOENT && errno != EINTR) {
