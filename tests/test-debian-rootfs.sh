@@ -11,7 +11,8 @@
 #   - libc itself opened from the rootfs (checked through /proc/self/maps).
 #
 # Not covered, and reported as KNOWN-LIMIT when probed:
-#   - execve() of a virtual absolute path (not hooked by design, see README),
+#   - execve() of host-only paths: the exec falls back to the host, but files
+#     the program opens are still mapped into the rootfs (see README),
 #   - the ELF interpreter, which the kernel loads from the host.
 #
 # SKIP (exit 0 with a SKIP line) when the host has no Debian/glibc userland,
@@ -164,13 +165,32 @@ check_ok 'rm (rootfs coreutils)' rfs "$root/usr/bin/rm" "$guest/moved2" "$guest/
 check_out 'dash reads rootfs file via builtins' 'root:x:0:0:root:/root:/bin/sh' \
     rfs "$root/usr/bin/dash" -c 'IFS= read -r line < /etc/passwd; printf "%s\n" "$line"'
 
-# execve of a virtual absolute path. Not hooked by design: the host has no
-# /usr/bin/rsh-probe, so the expected result today is a KNOWN-LIMIT.
+# execve through the shim: a rootfs shebang script, a rootfs ELF started
+# through the rootfs loader (its libc must come from the rootfs), and the
+# fake uid seen by a program started that way.
 probe_out=$(rfs "$root/usr/bin/dash" -c '/usr/bin/rsh-probe' 2>&1)
 if [ "$probe_out" = 'from-rootfs' ]; then
-    pass 'execve of virtual absolute path runs rootfs binary'
+    pass 'execve of rootfs shebang script runs rootfs interpreter'
 else
-    limit "execve of /usr/bin/rsh-probe not mapped (execve is not hooked; got: $probe_out)"
+    bad "execve of rootfs shebang script (got: $probe_out)"
+fi
+check_out 'execve-launched id sees fake uid 0' 0 \
+    rfs "$root/usr/bin/dash" -c '/usr/bin/id -u'
+if rfs "$root/usr/bin/dash" -c '/usr/bin/cat /proc/self/maps' | grep -F "$root/" | grep -q 'libc'; then
+    pass 'execve-launched program maps libc from rootfs'
+else
+    bad 'execve-launched program maps libc from rootfs'
+fi
+
+# Host-only path: exec is handed to the host, but the script reads its own file
+# through open(), which is mapped into the rootfs. Expected today: KNOWN-LIMIT.
+printf '#!/bin/sh\necho from-host\n' > "$tmp/host-probe"
+chmod 755 "$tmp/host-probe"
+host_out=$(rfs "$root/usr/bin/dash" -c "$tmp/host-probe" 2>&1)
+if [ "$host_out" = 'from-host' ]; then
+    pass 'host-only script runs through host fallback'
+else
+    limit "host-only script: exec falls back to host but open() maps into rootfs (got: $host_out)"
 fi
 
 if [ -e "$guest" ]; then

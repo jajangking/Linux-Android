@@ -30,12 +30,18 @@ Path di luar `ROOTSHIM_ROOT` **tidak terlihat** bagi proses yang dipetakan. Kare
 
 Beberapa perangkat Android menolak `link(2)`/`linkat(2)` untuk proses aplikasi, bahkan tanpa shim (terukur di Termux arm64). Itu batas platform, bukan kesalahan shim. Karena itu `tests/test-rootshim-hooks.sh` memeriksa dulu dukungan hard link di host (tanpa shim). Jika host menolak, pemeriksaan `linkat`/`link` dilaporkan sebagai `skip`; pemeriksaan lain tetap wajib lulus. Pemeriksaan `rename`/`unlink` memakai file sendiri, sehingga tidak bergantung pada hard link.
 
-## Keputusan: `execve` tidak dipetakan
+## Keputusan: `execve` rootfs-first (B2)
 
-`execve`/`execv`/`execvp` dan turunannya **tidak** di-hook. Alasannya: shell dan program lain mencari binary lewat `PATH` host dengan `execve`; jika `execve` dipetakan, binary host yang valid akan hilang dari pandangan. Akibatnya:
+`execve` dan `execv` (serta `syscall(SYS_execve, ...)`) dicegat. Kebijakannya rootfs-first dengan fallback host, bukan pemetaan buta:
 
-- Program yang meng-exec path absolut di dalam rootfs (mis. `/usr/bin/foo` milik Debian) akan menjalankan binary host di path yang sama, bukan milik rootfs.
-- Mengubah perilaku ini memerlukan kebijakan lookup terpisah (rootfs-first dengan fallback host); belum dikerjakan.
+- **ELF dinamis** (ada `PT_INTERP`) di rootfs dijalankan sebagai `ld-linux` rootfs dengan `--library-path` rootfs, `--argv0` sama dengan argv[0] asli, lalu program yang sudah dipetakan. Dengan begitu libc dimuat dari rootfs.
+- **Shebang** dijalankan ulang sebagai interpreter-nya (rekursi maksimal 4 tingkat), dengan argv yang sama seperti yang dibangun kernel.
+- **ELF statis** dan binary yang arsitekturnya tidak cocok diserahkan ke kernel dengan path yang sudah dipetakan.
+- **Path yang tidak ada di rootfs** diteruskan ke exec host apa adanya. Ini batas: file yang dibuka program itu tetap dipetakan ke rootfs (`open()` tidak punya fallback host), sehingga skrip host yang membaca file-nya sendiri gagal. Ini terukur di `tests/test-debian-rootfs.sh` sebagai KNOWN-LIMIT.
+- **Symlink akhir** di-resolve di dalam rootfs (maksimal 16 hop); target absolut dibasiskan ulang ke root. Symlink direktori perantara diserahkan ke kernel.
+- **Tidak tercakup:** `execvp`/`execl*` yang tidak melewati `execve` PLT, `posix_spawn` (glibc memanggil `__execve` internal), inline asm, dan binary statis yang melakukan syscall sendiri.
+- Hasil uji: shebang rootfs, `/usr/bin/id -u` lewat `execve` (uid 0), dan libc dari rootfs untuk program yang di-exec tercatat di `tests/test-debian-rootfs.sh`. Belum diuji di Termux (Bionic).
+- Override jalur library loader: env `ROOTSHIM_LOADER_LIBPATH`.
 
 ## Identitas dan `getgroups`
 
@@ -117,25 +123,26 @@ Supervisor memasang `LD_PRELOAD` hanya pada proses anak. Untuk program Debian/gl
 
 ### Hasil uji rootfs Debian (`test-debian-rootfs.sh`)
 
-Tes ini memakai coreutils, bash, dash, dan libc6 Debian 12 yang sebenarnya, di host x86_64 Debian 12. Yang sudah terbukti: `cp`, `mv` (termasuk jalur `renameat2` wrapper glibc), `ln`, `readlink`, `ls`, `rm`, `stat -c %u` (jalur statx glibc, pemilik tiruan), `id -u`, dan builtin dash, semuanya di bawah shim dan terbatas pada rootfs.
+Tes ini memakai coreutils, bash, dash, dan libc6 Debian 12 yang sebenarnya, di host x86_64 Debian 12. Sumber paketnya adalah paket host Debian 12 (glibc 2.36-9+deb12u14, coreutils 9.1-1, bash 5.2.15, dash 0.5.12), **bukan** mirror. Yang sudah terbukti: `cp`, `mv` (termasuk jalur `renameat2` wrapper glibc), `ln`, `readlink`, `ls`, `rm`, `stat -c %u` (jalur statx glibc, pemilik tiruan), `id -u`, builtin dash, shebang rootfs lewat `execve`, dan `id -u` lewat `execve` (uid 0), semuanya di bawah shim dan terbatas pada rootfs.
 
 Batas yang terukur dan **tidak** diperbaiki di shim:
 
 - **Loader dan libc dari host.** Jika binary dijalankan dengan path host-nya, kernel memuat ELF interpreter host, dan `ld.so` membuka libc host lewat pemanggilan internal yang tidak bisa dicegat `LD_PRELOAD`. Jika loader dipanggil langsung dari rootfs (`$ROOTFS/lib64/ld-linux-x86-64.so.2 --library-path ...`), libc dan library dimuat dari rootfs.
 - **NSS membaca `/etc/passwd` host.** `libnss_files` tidak mengimpor `fopen` atau `open`; ia memakai open internal glibc. Akibatnya `getent passwd root` di rootfs mengembalikan entri host. Ini tetap berlaku di kedua mode loader.
-- **`execve` path virtual tidak dipetakan** (lihat keputusan di atas).
+- **Exec host-only tidak bisa membaca file-nya sendiri** (lihat keputusan `execve` di atas).
+- **`execve` lewat `execvp`, `posix_spawn`, atau inline asm** belum dicegat.
 
-Untuk menutup dua batas pertama tanpa mengubah host, pilihannya adalah menjalankan semua binary lewat loader rootfs (mengubah cara `rootbox`/`rootbox-run.sh` memanggil program) atau meneruskan `openat` ke supervisor seccomp. Keduanya belum dikerjakan dan memerlukan keputusan terpisah.
+Program yang di-exec lewat shim sudah memakai libc rootfs (lihat keputusan `execve`). Untuk menutup dua batas pertama tanpa mengubah host, pilihannya adalah menjalankan semua binary lewat loader rootfs (mengubah cara `rootbox`/`rootbox-run.sh` memanggil program) atau meneruskan `openat` ke supervisor seccomp. Keduanya belum dikerjakan dan memerlukan keputusan terpisah.
 
-Target akhir berupa rootfs Debian ARM64 yang sudah diekstrak di penyimpanan privat Termux. Untuk menjalankannya dibutuhkan pekerjaan tambahan: pemanggilan glibc loader dari rootfs, kompatibilitas `PT_INTERP`/shebang, lookup `execve` yang rootfs-aware (lihat keputusan di atas), ownership virtual yang konsisten, serta uji tiap paket. Shim Bionic Termux **tidak** bisa langsung di-preload ke program glibc; shim harus dibangun untuk ABI glibc yang sama dengan program Debian.
+Target akhir berupa rootfs Debian ARM64 yang sudah diekstrak di penyimpanan privat Termux. Untuk menjalankannya dibutuhkan pekerjaan tambahan: pemanggilan glibc loader dari rootfs, kompatibilitas `PT_INTERP`/shebang, perluasan cakupan `execve` ke `execvp`/`posix_spawn` (B2 sudah mencakup `execve`/`execv`, lihat keputusan di atas), ownership virtual yang konsisten, serta uji tiap paket. Shim Bionic Termux **tidak** bisa langsung di-preload ke program glibc; shim harus dibangun untuk ABI glibc yang sama dengan program Debian.
 
 OpenCode dan CLI yang tersedia sebagai paket Termux sebaiknya dijalankan native lewat Termux terlebih dahulu. Menjalankan build Linux/glibc-nya di rootfs adalah target lanjutan, bukan kemampuan yang dijamin oleh proof of concept ini.
 
 ## Batas keamanan dan kompatibilitas
 
-- Jangan gunakan ini sebagai sandbox keamanan. Path translation berbasis `LD_PRELOAD` dapat dilewati oleh syscall langsung, executable statis/setuid, `execve` (tidak di-hook), proses yang membersihkan environment, dan symlink/path traversal yang belum ditangani. Symlink dengan target absolut tetap diselesaikan oleh kernel terhadap root host.
+- Jangan gunakan ini sebagai sandbox keamanan. Path translation berbasis `LD_PRELOAD` dapat dilewati oleh syscall langsung, executable statis/setuid, `execvp`/`posix_spawn` dan inline asm, proses yang membersihkan environment, dan symlink/path traversal yang belum ditangani. Symlink dengan target absolut tetap diselesaikan oleh kernel terhadap root host.
 - Pemetaan lexical: path virtual yang diawali persis dengan path host rootfs (mis. `/data/.../rootfs/etc/x`) dibiarkan apa adanya dan **tidak** dipetakan ulang.
 - Program tetap hanya memiliki izin Android/Termux biasa. `chown` yang tampak sukses tidak mengubah owner kernel; `uid=0` tiruan tidak dapat memasang filesystem atau mengakses perangkat yang dilarang Android. `/proc/self/status` dan `stat` lewat syscall yang tidak di-hook masih menampilkan UID/GID asli.
-- Syscall yang tidak di-hook (mis. `execve`, `getdents` langsung, `realpath` internal glibc) tidak tercakup pemetaan. Syscall mentah yang dipanggil lewat `syscall()` dari libc dipetakan untuk daftar path-argument yang dikenal; inline asm (`svc`) dan binary statis tidak.
+- Syscall yang tidak di-hook (mis. `getdents` langsung, `realpath` internal glibc, `execvp`/`posix_spawn`) tidak tercakup pemetaan. Syscall mentah yang dipanggil lewat `syscall()` dari libc dipetakan untuk daftar path-argument yang dikenal; inline asm (`svc`) dan binary statis tidak.
 - Seccomp user notification bergantung pada dukungan kernel **dan** kebijakan seccomp/SELinux aplikasi. ADB biasa tidak dapat menambahkan dukungan yang tidak ada. Pengisian daftar grup di jalur seccomp juga bergantung pada `process_vm_writev`, yang bisa ditolak kebijakan ptrace.
 - “Debian lengkap” dalam arti boot init/systemd atau mendapatkan hak kernel root tidak dapat dijanjikan pada batasan ini. Fokus eksperimen adalah CLI yang kooperatif dan dapat berjalan sebagai user-space process.
