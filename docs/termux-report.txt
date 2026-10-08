@@ -1,6 +1,6 @@
 
 ===== Environment =====
-date: Thu Oct  8 15:37:50 WIB 2026
+date: Thu Oct  8 15:57:03 WIB 2026
 uname: Linux localhost 6.12.38-android16-5-gb575a0b6e647-ab14355190-4k #1 SMP PREEMPT Wed Oct 29 06:56:12 UTC 2025 aarch64 Android
 arch: aarch64
 PREFIX: /data/data/com.termux/files/usr
@@ -8,21 +8,24 @@ TERMUX_VERSION: 0.119.0-beta.3
 uid (real, via id): 10496
 compiler: clang -> clang version 21.1.8
 make: GNU Make 4.4.1
-git HEAD: arena/a4c2b8db-linux-android @ b08452f
+git HEAD: arena/a4c2b8db-linux-android @ f6e3801
 Seccomp/NoNewPrivs of this shell:
-NoNewPrivs:	0
-Seccomp:	2
+  NoNewPrivs:	0
+  Seccomp:	2
 
-===== Step 1: build =====
+===== Step 1: build (make -B all, CC=clang) =====
 make: Entering directory '/data/data/com.termux/files/home/Linux-Android'
 mkdir -p build
 clang  -O2 -g -std=gnu11 -Wall -Wextra -fPIC -shared -o build/librootshim.so src/rootshim.c -ldl 
 clang  -O2 -g -std=gnu11 -Wall -Wextra -fPIC -o build/rootbox src/seccomp_supervisor.c 
 clang  -O2 -g -std=gnu11 -Wall -Wextra -fPIC -o build/rootshim-probe tests/rootshim_probe.c 
+clang  -O2 -g -std=gnu11 -Wall -Wextra -fPIC -D_FORTIFY_SOURCE=2 -o build/rootshim-hooks tests/rootshim_hooks.c 
+clang  -O2 -g -std=gnu11 -Wall -Wextra -fPIC -o build/repro-chroot-file tests/repro/chroot_file.c 
+clang  -O2 -g -std=gnu11 -Wall -Wextra -fPIC -o build/repro-getgroups tests/repro/getgroups.c 
 make: Leaving directory '/data/data/com.termux/files/home/Linux-Android'
-[PASS] make all (CC=clang)
+[PASS] make all
 
-===== Step 2: make test (smoke tests) =====
+===== Step 2: make test (full suite) =====
 [FAIL] make test -- see build/termux-test.log
 make: Entering directory '/data/data/com.termux/files/home/Linux-Android'
 sh tests/test-rootshim.sh
@@ -32,23 +35,91 @@ sh tests/test-supervisor.sh
 0
 seccomp supervisor smoke test: PASS
 sh tests/test-rootbox-combined.sh
-sh: 1: id: not found
-cwd=/ uid= marker=from-rootfs
-make: *** [Makefile:25: test] Error 1
+cwd=/ uid=0 gid=0 st_uid=0 marker=from-rootfs
+shell-marker=from-rootfs
+combined rootbox/shim smoke test: PASS
+sh tests/test-rootshim-hooks.sh
+ok    open(flags runtime) via __open_2
+ok    openat(flags runtime) via __openat_2
+ok    mkdirat
+ok    mkdir
+ok    rmdir
+ok    openat(O_CREAT, mode)
+ok    write to created file
+ok    symlinkat
+ok    symlink
+ok    readlinkat
+ok    readlink
+ok    unlink
+FAIL  linkat (errno=Permission denied)
+FAIL  link (errno=No such file or directory)
+FAIL  renameat (errno=No such file or directory)
+FAIL  rename (errno=No such file or directory)
+FAIL  unlinkat (errno=No such file or directory)
+FAIL  unlink (hard link) (errno=No such file or directory)
+ok    faccessat
+ok    access
+ok    fchmodat
+ok    chmod
+ok    truncate
+ok    utimensat(path)
+ok    stat
+ok    lstat (symlink itself)
+ok    fstatat
+ok    stat reports synthetic owner
+ok    getxattr
+ok    listxattr
+ok    removexattr
+ok    synthetic uid/gid are 0
+ok    getgroups lists synthetic group 0
+ok    '..' clamped at virtual root
+ok    chroot(file) fails ENOTDIR
+ok    virtual root intact after failed chroot
+ok    chroot(dir)
+ok    virtual path visible after chroot(dir)
+ok    outer rootfs path hidden after chroot(dir)
+summary failures=6
+rootshim hook regression: 6 failing check(s)
+make: *** [Makefile:37: test] Error 1
 make: Leaving directory '/data/data/com.termux/files/home/Linux-Android'
 
-===== Step 3: repro chroot() on a regular file (known bug) =====
+===== Step 3: repro chroot() on a regular file (fixed in round 2) =====
 chroot(/afile) rc=-1 errno=Not a directory
-open(/etc/marker) after failed chroot: fd=-1 errno=Not a directory
-[KNOWN-BUG] failed chroot() corrupts virtual root (rootshim.c chroot)
+open(/etc/marker) after failed chroot: fd=3 errno=ok
+[PASS] failed chroot() leaves virtual root intact
 
-===== Step 4: repro getgroups() under rootbox (known bug) =====
-getgroups n=0
+===== Step 4: repro getgroups() under rootbox (fixed in round 2) =====
+getgroups n=1 0
 egid=0
-[KNOWN-BUG] getgroups() returns 0 groups while getegid()==0 (seccomp_supervisor.c)
+[PASS] getgroups() lists group 0, consistent with getegid()
 
-===== Step 5: Termux probe (tools/probe-termux.sh) =====
-[PASS] probe-termux.sh ran to completion
+===== Step 5: coreutils under shim (tests/test-coreutils-shim.sh) =====
+ok    cat
+ok    mkdir
+ok    mkdir landed in rootfs
+ok    cp
+ok    cp landed in rootfs
+FAIL  mv (mv: cannot move '/rsh-coreutils/copy' to '/rsh-coreutils/moved': No such file or directory)
+FAIL  mv renamed inside rootfs
+ok    ln
+ok    ln -s created symlink in rootfs
+ok    readlink
+ok    ls
+ok    stat-size
+ok    dd
+ok    dd wrote into rootfs
+ok    head
+FAIL  chmod (chmod: cannot access '/rsh-coreutils/moved': No such file or directory)
+FAIL  chmod changed rootfs file
+ok    truncate
+ok    truncate affected rootfs file
+ok    touch
+FAIL  rm (rm: cannot remove '/rsh-coreutils/moved': No such file or directory)
+ok    rm removed rootfs files
+coreutils under shim: 5 failing check(s)
+[FAIL] coreutils leak or failure -- see output above
+
+===== Step 6: Termux probe (tools/probe-termux.sh) =====
 == Termux / Android probe ==
 uname: Linux localhost 6.12.38-android16-5-gb575a0b6e647-ab14355190-4k #1 SMP PREEMPT Wed Oct 29 06:56:12 UTC 2025 aarch64 Android
 PREFIX: /data/data/com.termux/files/usr
@@ -68,8 +139,9 @@ uid=0(root) gid=0(root) groups=0(root) context=u:r:untrusted_app_27:s0:c240,c257
 seccomp-child-ran
 seccomp supervisor child exit: 0
 probe complete
+[PASS] probe-termux.sh ran to completion
 
 ===== Summary =====
-PASS=2 FAIL=1 KNOWN-BUG=2 SKIP=0 ERROR=0
+PASS=4 FAIL=2 SKIP=0 ERROR=0
 Report: /data/data/com.termux/files/home/Linux-Android/build/termux-report.txt
 Attach this file (build/termux-report.txt) when handing results back.
