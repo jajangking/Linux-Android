@@ -10,10 +10,9 @@
 #   - NSS lookups (getent, id -un) resolved from files inside the rootfs,
 #   - libc itself opened from the rootfs (checked through /proc/self/maps).
 #
-# Not covered, and reported as KNOWN-LIMIT when probed:
-#   - execve() of host-only paths: the exec falls back to the host, but files
-#     the program opens are still mapped into the rootfs (see README),
-#   - the ELF interpreter, which the kernel loads from the host.
+# Known limits: none. Each former KNOWN-LIMIT (NSS, the kernel-loaded libc,
+# host-only scripts) is now a checked PASS. The limit() helper stays for new
+# probes that cannot pass yet.
 #
 # SKIP (exit 0 with a SKIP line) when the host has no Debian/glibc userland,
 # for example on Termux/Bionic.
@@ -62,6 +61,9 @@ fi
 mkdir -p "$root/etc" "$root/root" "$root/tmp"
 printf 'root:x:0:0:root:/root:/bin/sh\n' > "$root/etc/passwd"
 printf 'root:x:0:\n' > "$root/etc/group"
+# Account that exists only in the rootfs: proves NSS reads the rootfs files.
+printf 'rootshimtest:x:4242:4242:rootfs only:/:/bin/sh\n' >> "$root/etc/passwd"
+printf 'rootshimtest:x:4242:\n' >> "$root/etc/group"
 printf 'passwd: files\ngroup: files\nshadow: files\nhosts: files\n' > "$root/etc/nsswitch.conf"
 # Rootfs-only probe for execve: exists only inside the rootfs.
 printf '#!/bin/sh\necho from-rootfs\n' > "$root/usr/bin/rsh-probe"
@@ -120,21 +122,44 @@ check_out 'id -un resolves fake uid 0 to root' root rfs "$root/usr/bin/id" -un
 check_out 'stat -c %u reports fake owner (glibc statx path)' 0 \
     rfs "$root/usr/bin/stat" -c %u /etc/passwd
 
-# NSS: libnss_files reads passwd through glibc-internal opens, which LD_PRELOAD
-# cannot interpose. Expected today: the host's passwd entry comes back.
+# NSS: getpw*/getgr* are answered from the rootfs files by the shim. The
+# rootfs-only account exists nowhere on the host, so it shows the source.
 nss_out=$(rfs "$root/usr/bin/getent" passwd root 2>&1)
 if [ "$nss_out" = 'root:x:0:0:root:/root:/bin/sh' ]; then
     pass 'NSS lookup reads rootfs /etc/passwd'
 else
-    limit "NSS lookup reads host /etc/passwd (libnss_files uses glibc-internal open; got: $nss_out)"
+    bad "NSS lookup reads rootfs /etc/passwd (got: $nss_out)"
+fi
+check_out 'NSS lookup finds rootfs-only account' \
+    'rootshimtest:x:4242:4242:rootfs only:/:/bin/sh' \
+    rfs "$root/usr/bin/getent" passwd rootshimtest
+check_out 'id -u resolves rootfs-only account' 4242 \
+    rfs "$root/usr/bin/id" -u rootshimtest
+check_out 'getent group reads rootfs /etc/group' 'rootshimtest:x:4242:' \
+    rfs "$root/usr/bin/getent" group rootshimtest
+enum_out=$(rfs "$root/usr/bin/getent" passwd 2>&1)
+enum_want=$(printf 'root:x:0:0:root:/root:/bin/sh\nrootshimtest:x:4242:4242:rootfs only:/:/bin/sh')
+if [ "$enum_out" = "$enum_want" ]; then
+    pass 'NSS enumeration (getent passwd) lists rootfs accounts only'
+else
+    bad "NSS enumeration (got: $enum_out)"
+fi
+# Without ROOTSHIM_ROOT the hooks must pass through to the host unchanged.
+host_pw=$(getent passwd root 2>&1)
+shim_pw=$(env LD_PRELOAD="$shim" getent passwd root 2>&1)
+if [ -n "$host_pw" ] && [ "$host_pw" = "$shim_pw" ]; then
+    pass 'NSS hooks pass through to host without ROOTSHIM_ROOT'
+else
+    bad "NSS hooks pass through without ROOTSHIM_ROOT (host: $host_pw, shim: $shim_pw)"
 fi
 
-# libc source. Kernel-loaded ELF: the host loader maps host libc (ld.so's own
-# opens are not interposable). Explicit rootfs loader: must map rootfs libc.
+# libc source. Kernel-loaded ELF: the host kernel first loads host libc, then
+# the shim re-runs the program once through the rootfs loader. Explicit rootfs
+# loader: must map rootfs libc.
 if rfs "$root/usr/bin/cat" /proc/self/maps | grep -F "$root/" | grep -q 'libc'; then
-    pass 'kernel-loaded binary maps libc from rootfs'
+    pass 'kernel-loaded binary re-runs through rootfs loader and maps rootfs libc'
 else
-    limit 'kernel-loaded binary maps host libc, not rootfs libc (host ELF interpreter; ld.so opens are not interposable)'
+    bad 'kernel-loaded binary maps libc from rootfs'
 fi
 if rld "$root/usr/bin/cat" /proc/self/maps | grep -F "$root/" | grep -q 'libc'; then
     pass 'rootfs loader maps libc from rootfs'
@@ -182,15 +207,15 @@ else
     bad 'execve-launched program maps libc from rootfs'
 fi
 
-# Host-only path: exec is handed to the host, but the script reads its own file
-# through open(), which is mapped into the rootfs. Expected today: KNOWN-LIMIT.
+# Host-only script: not in the rootfs, so the shim runs it with the rootfs shell
+# and passes the file as /proc/self/fd/N (/proc is not mapped).
 printf '#!/bin/sh\necho from-host\n' > "$tmp/host-probe"
 chmod 755 "$tmp/host-probe"
 host_out=$(rfs "$root/usr/bin/dash" -c "$tmp/host-probe" 2>&1)
 if [ "$host_out" = 'from-host' ]; then
-    pass 'host-only script runs through host fallback'
+    pass 'host-only script runs through rootfs shell'
 else
-    limit "host-only script: exec falls back to host but open() maps into rootfs (got: $host_out)"
+    bad "host-only script runs through rootfs shell (got: $host_out)"
 fi
 
 if [ -e "$guest" ]; then

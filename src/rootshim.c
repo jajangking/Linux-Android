@@ -4,7 +4,9 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <limits.h>
+#include <pwd.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -28,15 +30,22 @@
  * binaries import instead of open()/openat() when built with fortify.
  *
  * execve()/execv() are hooked: a program found inside the rootfs is run
- * through the rootfs's own dynamic loader (see "execve" below). Paths that do
- * not exist in the rootfs go to the host unchanged, so host PATH entries keep
- * working. See README.md "Batas keamanan dan kompatibilitas".
+ * through the rootfs's own dynamic loader, and a host script is run by the
+ * rootfs shell (see "execve" below). Host ELF binaries outside the rootfs
+ * are passed to the kernel unchanged. getpw and getgr read the rootfs's
+ * /etc/passwd and /etc/group. A program started from the rootfs by the host
+ * kernel re-runs once through the rootfs loader. See README.md
+ * "Batas keamanan dan kompatibilitas".
  */
 
 static char root_dir[PATH_MAX];
 static size_t root_len;
 static int fake_identity;
 static int resolving_symbols;
+
+static int exec_rooted(const char *path, char *const argv[],
+                       char *const envp[], int depth);
+extern char **environ;
 
 #define LOAD_NEXT(var, name) do {                                      \
     if (!(var) && !resolving_symbols) {                                \
@@ -158,6 +167,107 @@ static char *map_path(const char *path)
     return strdup(result);
 }
 
+/* Read /proc/self/cmdline into argv. The backing buffer is returned in *backing. */
+static char **cmdline_argv(char **backing)
+{
+    FILE *f = fopen("/proc/self/cmdline", "r");
+    if (!f)
+        return NULL;
+    size_t cap = 512, used = 0;
+    char *buf = malloc(cap);
+    while (buf) {
+        size_t n = fread(buf + used, 1, cap - used, f);
+        used += n;
+        if (used < cap)
+            break;
+        char *nb = realloc(buf, cap * 2);
+        if (!nb) {
+            free(buf);
+            buf = NULL;
+            break;
+        }
+        buf = nb;
+        cap *= 2;
+    }
+    fclose(f);
+    if (!buf || used == 0 || buf[used - 1] != '\0') {
+        free(buf);
+        return NULL;
+    }
+    size_t argc = 0;
+    for (size_t i = 0; i < used; ++i)
+        if (buf[i] == '\0')
+            ++argc;
+    char **argv = calloc(argc + 1, sizeof *argv);
+    if (!argv) {
+        free(buf);
+        return NULL;
+    }
+    size_t k = 0, start = 0;
+    for (size_t i = 0; i < used; ++i) {
+        if (buf[i] == '\0') {
+            argv[k++] = buf + start;
+            start = i + 1;
+        }
+    }
+    *backing = buf;
+    return argv;
+}
+
+/* The host kernel loads a rootfs program with the host ELF interpreter, so its
+   libc comes from the host. Such a process runs its own loader once more, this
+   time through the rootfs loader. ROOTSHIM_REEXEC marks that second run; the
+   second run clears it, so children are not affected. */
+static void reexec_into_rootfs(void)
+{
+    if (getenv("ROOTSHIM_REEXEC")) {
+        unsetenv("ROOTSHIM_REEXEC");
+        return;
+    }
+    char exe[PATH_MAX];
+    ssize_t en = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (en <= 0)
+        return;
+    exe[en] = '\0';
+    if (strncmp(exe, root_dir, root_len) != 0 || exe[root_len] != '/')
+        return;
+
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps)
+        return;
+    char *line = NULL;
+    size_t cap = 0;
+    bool rootfs_libc = false, host_libc = false;
+    while (getline(&line, &cap, maps) > 0) {
+        char *path = strchr(line, '/');
+        if (!path || !strstr(path, "/libc.so"))
+            continue;
+        if (strncmp(path, root_dir, root_len) == 0 && path[root_len] == '/')
+            rootfs_libc = true;
+        else
+            host_libc = true;
+    }
+    free(line);
+    fclose(maps);
+    if (rootfs_libc || !host_libc)
+        return;
+
+    char *backing = NULL;
+    char **argv = cmdline_argv(&backing);
+    if (!argv || !argv[0]) {
+        free(argv);
+        free(backing);
+        return;
+    }
+    setenv("ROOTSHIM_REEXEC", "1", 1);
+    /* exe is a host path inside the rootfs; the virtual path is the rest. */
+    exec_rooted(exe + root_len, argv, environ, 0);
+    /* Reached only if the exec failed: keep running with the host libc. */
+    unsetenv("ROOTSHIM_REEXEC");
+    free(argv);
+    free(backing);
+}
+
 static void init_rootshim(void) __attribute__((constructor));
 static void init_rootshim(void)
 {
@@ -179,6 +289,7 @@ static void init_rootshim(void)
     root_dir[n] = '\0';
     root_len = n;
     free(resolved);
+    reexec_into_rootfs();
 }
 
 static void fake_stat_owner(struct stat *st)
@@ -1063,6 +1174,488 @@ static void raw_close(long fd)
     real_syscall(SYS_close, fd, 0L, 0L, 0L, 0L, 0L);
 }
 
+/* ---- user and group databases ------------------------------------------ */
+
+/* libnss_files reads /etc/passwd and /etc/group through glibc-internal opens,
+   which LD_PRELOAD cannot see. The getpw and getgr functions below answer from
+   the rootfs copies instead. With no rootfs they call the next implementation. */
+
+#define ROOTSHIM_NSS_BUF 8192
+
+struct nss_cursor {
+    char *text;
+    size_t len;
+    size_t pos;
+    bool open;
+};
+static struct nss_cursor pw_cursor, gr_cursor;
+static struct passwd enum_pw;
+static struct group enum_gr;
+static char enum_pw_buf[ROOTSHIM_NSS_BUF];
+static char enum_gr_buf[ROOTSHIM_NSS_BUF];
+
+/* Whole file <root>/etc/<name>, NUL-terminated. NULL if it is missing. */
+static char *nss_read(const char *name, size_t *len)
+{
+    char path[PATH_MAX];
+    int pn = snprintf(path, sizeof path, "%s/etc/%s", root_dir, name);
+    if (pn < 0 || (size_t)pn >= sizeof path) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    long fd = raw_openat_ro(path);
+    if (fd < 0)
+        return NULL;
+    size_t cap = 4096, used = 0;
+    char *buf = malloc(cap + 1);
+    while (buf) {
+        if (used == cap) {
+            char *nb = realloc(buf, cap * 2 + 1);
+            if (!nb) {
+                free(buf);
+                buf = NULL;
+                break;
+            }
+            buf = nb;
+            cap *= 2;
+        }
+        long r = raw_pread(fd, buf + used, cap - used, (long)used);
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+            free(buf);
+            buf = NULL;
+            break;
+        }
+        if (r == 0)
+            break;
+        used += (size_t)r;
+    }
+    raw_close(fd);
+    if (!buf) {
+        errno = EIO;
+        return NULL;
+    }
+    buf[used] = '\0';
+    *len = used;
+    return buf;
+}
+
+/* Copy the next data line (no comments, no blanks) into buf. *too_big is set
+   when the line does not fit; the position still moves past it. */
+static bool nss_next_line(const char *text, size_t len, size_t *pos, char *buf,
+                          size_t bufsz, size_t *out_len, bool *too_big)
+{
+    *too_big = false;
+    while (*pos < len) {
+        size_t start = *pos;
+        const char *nl = memchr(text + start, '\n', len - start);
+        size_t end = nl ? (size_t)(nl - text) : len;
+        *pos = nl ? end + 1 : len;
+        size_t n = end - start;
+        if (n == 0 || text[start] == '#')
+            continue;
+        if (n >= bufsz) {
+            *too_big = true;
+            return false;
+        }
+        memcpy(buf, text + start, n);
+        buf[n] = '\0';
+        *out_len = n;
+        return true;
+    }
+    return false;
+}
+
+/* Split line in place at ':'. Returns the total field count; only the first
+   max fields are stored. */
+static int nss_split(char *line, char *fields[], int max)
+{
+    int n = 0;
+    char *p = line;
+    for (;;) {
+        char *c = strchr(p, ':');
+        if (n < max)
+            fields[n] = p;
+        ++n;
+        if (!c)
+            break;
+        if (n <= max)
+            *c = '\0';
+        p = c + 1;
+    }
+    return n;
+}
+
+static bool nss_id(const char *s, unsigned long *out)
+{
+    if (!*s)
+        return false;
+    char *end;
+    errno = 0;
+    unsigned long v = strtoul(s, &end, 10);
+    if (*end != '\0' || errno)
+        return false;
+    *out = v;
+    return true;
+}
+
+static bool nss_fill_passwd(char *line, struct passwd *pw)
+{
+    char *f[7];
+    if (nss_split(line, f, 7) != 7)
+        return false;
+    unsigned long uid, gid;
+    if (!nss_id(f[2], &uid) || !nss_id(f[3], &gid))
+        return false;
+    pw->pw_name = f[0];
+    pw->pw_passwd = f[1];
+    pw->pw_uid = (uid_t)uid;
+    pw->pw_gid = (gid_t)gid;
+    pw->pw_gecos = f[4];
+    pw->pw_dir = f[5];
+    pw->pw_shell = f[6];
+    return true;
+}
+
+/* 0 = filled, EINVAL = not a group line, ERANGE = buffer too small. The member
+   pointer array is placed in buf after the line. */
+static int nss_fill_group(char *buf, size_t buflen, size_t linelen,
+                          struct group *gr)
+{
+    char *f[4];
+    if (nss_split(buf, f, 4) != 4)
+        return EINVAL;
+    unsigned long gid;
+    if (!nss_id(f[2], &gid))
+        return EINVAL;
+    size_t members = 0;
+    if (*f[3]) {
+        members = 1;
+        for (const char *c = f[3]; *c; ++c)
+            if (*c == ',')
+                ++members;
+    }
+    size_t off = linelen + 1;
+    size_t mis = ((uintptr_t)(buf + off)) % sizeof(char *);
+    if (mis)
+        off += sizeof(char *) - mis;
+    if (off > buflen || (members + 1) * sizeof(char *) > buflen - off)
+        return ERANGE;
+    char **mem = (char **)(void *)(buf + off);
+    size_t k = 0;
+    if (members) {
+        char *p = f[3];
+        for (;;) {
+            char *c = strchr(p, ',');
+            mem[k++] = p;
+            if (!c)
+                break;
+            *c = '\0';
+            p = c + 1;
+        }
+    }
+    mem[k] = NULL;
+    gr->gr_name = f[0];
+    gr->gr_passwd = f[1];
+    gr->gr_gid = (gid_t)gid;
+    gr->gr_mem = mem;
+    return 0;
+}
+
+static int nss_passwd_find(const char *name, uid_t uid, bool by_name,
+                           struct passwd *pw, char *buf, size_t buflen,
+                           struct passwd **result)
+{
+    *result = NULL;
+    size_t len = 0;
+    char *text = nss_read("passwd", &len);
+    if (!text)
+        return 0;
+    int rc = 0;
+    size_t pos = 0, linelen = 0;
+    bool too_big = false;
+    while (nss_next_line(text, len, &pos, buf, buflen, &linelen, &too_big)) {
+        if (!nss_fill_passwd(buf, pw))
+            continue;
+        if (by_name ? strcmp(pw->pw_name, name) == 0 : pw->pw_uid == uid) {
+            *result = pw;
+            break;
+        }
+    }
+    if (!*result && too_big)
+        rc = ERANGE;
+    free(text);
+    return rc;
+}
+
+static int nss_group_find(const char *name, gid_t gid, bool by_name,
+                          struct group *gr, char *buf, size_t buflen,
+                          struct group **result)
+{
+    *result = NULL;
+    size_t len = 0;
+    char *text = nss_read("group", &len);
+    if (!text)
+        return 0;
+    int rc = 0;
+    size_t pos = 0, linelen = 0;
+    bool too_big = false;
+    while (nss_next_line(text, len, &pos, buf, buflen, &linelen, &too_big)) {
+        int fr = nss_fill_group(buf, buflen, linelen, gr);
+        if (fr == ERANGE) {
+            rc = ERANGE;
+            break;
+        }
+        if (fr != 0)
+            continue;
+        if (by_name ? strcmp(gr->gr_name, name) == 0 : gr->gr_gid == gid) {
+            *result = gr;
+            break;
+        }
+    }
+    if (!*result && too_big)
+        rc = ERANGE;
+    free(text);
+    return rc;
+}
+
+static bool nss_cursor_load(struct nss_cursor *c, const char *name)
+{
+    if (!c->open) {
+        c->text = nss_read(name, &c->len);
+        c->pos = 0;
+        c->open = true;
+    }
+    return c->text != NULL;
+}
+
+static void nss_cursor_close(struct nss_cursor *c)
+{
+    free(c->text);
+    c->text = NULL;
+    c->len = 0;
+    c->pos = 0;
+    c->open = false;
+}
+
+static void nss_fail(int rc)
+{
+    errno = rc;
+}
+
+struct passwd *getpwnam(const char *name)
+{
+    static struct passwd pw;
+    static char buf[ROOTSHIM_NSS_BUF];
+    struct passwd *res = NULL;
+    if (!root_len) {
+        static struct passwd *(*next)(const char *);
+        LOAD_NEXT(next, "getpwnam");
+        return next ? next(name) : NULL;
+    }
+    int rc = nss_passwd_find(name, 0, true, &pw, buf, sizeof buf, &res);
+    if (rc)
+        { nss_fail(rc); return NULL; }
+    return res;
+}
+
+struct passwd *getpwuid(uid_t uid)
+{
+    static struct passwd pw;
+    static char buf[ROOTSHIM_NSS_BUF];
+    struct passwd *res = NULL;
+    if (!root_len) {
+        static struct passwd *(*next)(uid_t);
+        LOAD_NEXT(next, "getpwuid");
+        return next ? next(uid) : NULL;
+    }
+    int rc = nss_passwd_find(NULL, uid, false, &pw, buf, sizeof buf, &res);
+    if (rc)
+        { nss_fail(rc); return NULL; }
+    return res;
+}
+
+int getpwnam_r(const char *name, struct passwd *pwd, char *buf, size_t buflen,
+               struct passwd **result)
+{
+    if (!root_len) {
+        static int (*next)(const char *, struct passwd *, char *, size_t,
+                           struct passwd **);
+        LOAD_NEXT(next, "getpwnam_r");
+        return next ? next(name, pwd, buf, buflen, result) : ENOSYS;
+    }
+    return nss_passwd_find(name, 0, true, pwd, buf, buflen, result);
+}
+
+int getpwuid_r(uid_t uid, struct passwd *pwd, char *buf, size_t buflen,
+               struct passwd **result)
+{
+    if (!root_len) {
+        static int (*next)(uid_t, struct passwd *, char *, size_t,
+                           struct passwd **);
+        LOAD_NEXT(next, "getpwuid_r");
+        return next ? next(uid, pwd, buf, buflen, result) : ENOSYS;
+    }
+    return nss_passwd_find(NULL, uid, false, pwd, buf, buflen, result);
+}
+
+struct group *getgrnam(const char *name)
+{
+    static struct group gr;
+    static char buf[ROOTSHIM_NSS_BUF];
+    struct group *res = NULL;
+    if (!root_len) {
+        static struct group *(*next)(const char *);
+        LOAD_NEXT(next, "getgrnam");
+        return next ? next(name) : NULL;
+    }
+    int rc = nss_group_find(name, 0, true, &gr, buf, sizeof buf, &res);
+    if (rc)
+        { nss_fail(rc); return NULL; }
+    return res;
+}
+
+struct group *getgrgid(gid_t gid)
+{
+    static struct group gr;
+    static char buf[ROOTSHIM_NSS_BUF];
+    struct group *res = NULL;
+    if (!root_len) {
+        static struct group *(*next)(gid_t);
+        LOAD_NEXT(next, "getgrgid");
+        return next ? next(gid) : NULL;
+    }
+    int rc = nss_group_find(NULL, gid, false, &gr, buf, sizeof buf, &res);
+    if (rc)
+        { nss_fail(rc); return NULL; }
+    return res;
+}
+
+int getgrnam_r(const char *name, struct group *grp, char *buf, size_t buflen,
+               struct group **result)
+{
+    if (!root_len) {
+        static int (*next)(const char *, struct group *, char *, size_t,
+                           struct group **);
+        LOAD_NEXT(next, "getgrnam_r");
+        return next ? next(name, grp, buf, buflen, result) : ENOSYS;
+    }
+    return nss_group_find(name, 0, true, grp, buf, buflen, result);
+}
+
+int getgrgid_r(gid_t gid, struct group *grp, char *buf, size_t buflen,
+               struct group **result)
+{
+    if (!root_len) {
+        static int (*next)(gid_t, struct group *, char *, size_t,
+                           struct group **);
+        LOAD_NEXT(next, "getgrgid_r");
+        return next ? next(gid, grp, buf, buflen, result) : ENOSYS;
+    }
+    return nss_group_find(NULL, gid, false, grp, buf, buflen, result);
+}
+
+/* Enumeration (getent without a key). */
+void setpwent(void)
+{
+    if (!root_len) {
+        static void (*next)(void);
+        LOAD_NEXT(next, "setpwent");
+        if (next)
+            next();
+        return;
+    }
+    nss_cursor_close(&pw_cursor);
+    nss_cursor_load(&pw_cursor, "passwd");
+}
+
+void endpwent(void)
+{
+    if (!root_len) {
+        static void (*next)(void);
+        LOAD_NEXT(next, "endpwent");
+        if (next)
+            next();
+        return;
+    }
+    nss_cursor_close(&pw_cursor);
+}
+
+struct passwd *getpwent(void)
+{
+    if (!root_len) {
+        static struct passwd *(*next)(void);
+        LOAD_NEXT(next, "getpwent");
+        return next ? next() : NULL;
+    }
+    if (!nss_cursor_load(&pw_cursor, "passwd"))
+        return NULL;
+    size_t linelen = 0;
+    bool too_big = false;
+    for (;;) {
+        if (!nss_next_line(pw_cursor.text, pw_cursor.len, &pw_cursor.pos,
+                           enum_pw_buf, sizeof enum_pw_buf, &linelen,
+                           &too_big)) {
+            if (too_big)
+                continue;
+            return NULL;
+        }
+        if (nss_fill_passwd(enum_pw_buf, &enum_pw))
+            return &enum_pw;
+    }
+}
+
+void setgrent(void)
+{
+    if (!root_len) {
+        static void (*next)(void);
+        LOAD_NEXT(next, "setgrent");
+        if (next)
+            next();
+        return;
+    }
+    nss_cursor_close(&gr_cursor);
+    nss_cursor_load(&gr_cursor, "group");
+}
+
+void endgrent(void)
+{
+    if (!root_len) {
+        static void (*next)(void);
+        LOAD_NEXT(next, "endgrent");
+        if (next)
+            next();
+        return;
+    }
+    nss_cursor_close(&gr_cursor);
+}
+
+struct group *getgrent(void)
+{
+    if (!root_len) {
+        static struct group *(*next)(void);
+        LOAD_NEXT(next, "getgrent");
+        return next ? next() : NULL;
+    }
+    if (!nss_cursor_load(&gr_cursor, "group"))
+        return NULL;
+    size_t linelen = 0;
+    bool too_big = false;
+    for (;;) {
+        if (!nss_next_line(gr_cursor.text, gr_cursor.len, &gr_cursor.pos,
+                           enum_gr_buf, sizeof enum_gr_buf, &linelen,
+                           &too_big)) {
+            if (too_big)
+                continue;
+            return NULL;
+        }
+        if (nss_fill_group(enum_gr_buf, sizeof enum_gr_buf, linelen,
+                           &enum_gr) == 0)
+            return &enum_gr;
+    }
+}
+
 /* Follow symlinks in the final component of a virtual path, inside the
    rootfs. Absolute targets stay virtual; relative ones are joined to the
    directory of the link. Intermediate directory links are left to the kernel.
@@ -1275,6 +1868,58 @@ static int exec_via_loader(const char *mapped_prog, const char *interp,
     return rc;
 }
 
+/* A path that is not in the rootfs. A host shell script is run by the rootfs
+   shell, with the script passed as /proc/self/fd/N: /proc is not mapped, so the
+   interpreter reads the host file through the inherited descriptor. Anything
+   that is not a script goes to the host exec unchanged. $0 in such a script is
+   the /proc/self/fd/N path. */
+static int exec_host_script(const char *path, char *const argv[],
+                            char *const envp[], int depth)
+{
+    long hfd = raw_openat_ro(path);
+    if (hfd < 0)
+        return passthrough_exec(path, argv, envp);
+    unsigned char head[256];
+    long n = raw_pread(hfd, head, sizeof head, 0);
+    char sinterp[PATH_MAX];
+    char sopt[256];
+    bool has_opt = false;
+    if (n < 2 || head[0] != '#' || head[1] != '!' ||
+        !parse_shebang(head, (size_t)n, sinterp, sizeof sinterp, sopt,
+                       sizeof sopt, &has_opt)) {
+        raw_close(hfd);
+        return passthrough_exec(path, argv, envp);
+    }
+    /* Keep the descriptor across exec (raw_openat_ro sets O_CLOEXEC). */
+    real_syscall(SYS_fcntl, hfd, (long)F_SETFD, 0L, 0L, 0L, 0L);
+    char script[64];
+    snprintf(script, sizeof script, "/proc/self/fd/%ld", hfd);
+
+    size_t argc = 0;
+    while (argv && argv[argc])
+        ++argc;
+    char **nargv = calloc(argc + 4, sizeof *nargv);
+    if (!nargv) {
+        raw_close(hfd);
+        errno = ENOMEM;
+        return -1;
+    }
+    size_t k = 0;
+    nargv[k++] = sinterp;
+    if (has_opt)
+        nargv[k++] = sopt;
+    nargv[k++] = script;
+    for (size_t i = 1; i < argc; ++i)
+        nargv[k++] = argv[i];
+    nargv[k] = NULL;
+    int rc = exec_rooted(sinterp, nargv, envp, depth + 1);
+    int saved = errno;
+    free(nargv);
+    raw_close(hfd);
+    errno = saved;
+    return rc;
+}
+
 static int exec_rooted(const char *path, char *const argv[],
                        char *const envp[], int depth)
 {
@@ -1302,10 +1947,10 @@ static int exec_rooted(const char *path, char *const argv[],
 
     long fd = raw_openat_ro(mapped);
     if (fd < 0) {
-        /* Not in the rootfs: exec the host path unchanged (see the header note). */
+        /* Not in the rootfs: host scripts and host binaries (see exec_host_script). */
         release(mapped);
         free(virt);
-        return passthrough_exec(path, argv, envp);
+        return exec_host_script(path, argv, envp, depth);
     }
 
     unsigned char head[256];

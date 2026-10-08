@@ -1,17 +1,18 @@
-# Handoff ronde 5: regresi di Termux setelah shim execve (B2)
+# Handoff ronde 5: regresi di Termux setelah shim rootfs-first
 
 ## 1. Apa yang berubah sejak ronde 4
 
-- `src/rootshim.c` kini mencegat `execve` dan `execv` (serta `syscall(SYS_execve, ...)`). Kebijakannya rootfs-first dengan fallback host:
+- `src/rootshim.c` mencegat `execve` dan `execv` (serta `syscall(SYS_execve, ...)`). Kebijakannya rootfs-first:
   - ELF dinamis di rootfs dijalankan lewat `ld-linux` rootfs (`--library-path`, `--argv0`).
   - Shebang dijalankan ulang lewat interpreter-nya (rekursi maksimal 4).
-  - Path yang tidak ada di rootfs diteruskan ke exec host apa adanya.
-  - Jika `ROOTSHIM_ROOT` tidak di-set, jalur baru tidak aktif (passthrough). Di Termux tanpa rootfs, perilaku exec seharusnya sama seperti sebelumnya.
-- `make all` bersih dari warning (`-Wformat-truncation` sudah diperbaiki).
-- `tests/test-debian-rootfs.sh`: 26 cek PASS, 3 KNOWN-LIMIT di x86. Dua cek execve (shebang rootfs, `id -u` lewat `execve`) dan cek libc rootfs untuk program yang di-exec sekarang PASS.
-- Batas yang terukur dan tetap: exec ke path host-only diteruskan, tetapi file yang dibuka program itu tetap dipetakan ke rootfs (KNOWN-LIMIT).
+  - Skrip host di luar rootfs dijalankan oleh shell rootfs, dengan file diberikan sebagai `/proc/self/fd/N`.
+  - ELF host di luar rootfs diteruskan ke kernel apa adanya.
+- `getpwnam`, `getpwuid`, `getgrnam`, `getgrgid` (beserta versi `_r`), serta enumerasi `setpwent`/`getpwent`/`endpwent` dan padanan `gr`, kini membaca `etc/passwd` dan `etc/group` dari rootfs. Tanpa `ROOTSHIM_ROOT`, semuanya meneruskan ke implementasi berikutnya.
+- Constructor shim: program yang dijalankan kernel dari path rootfs tetapi memakai libc host dijalankan ulang **sekali** lewat loader rootfs. Penanda `ROOTSHIM_REEXEC` mencegah loop. Tanpa `ROOTSHIM_ROOT`, jalur ini tidak aktif.
+- `make all` bersih dari warning.
+- `tests/test-debian-rootfs.sh` di x86: 31 cek PASS, **0 KNOWN-LIMIT**.
 
-Catatan untuk Termux: ini perubahan pada kode yang belum pernah dikompilasi dengan Bionic. Yang perlu dicek adalah apakah `src/rootshim.c` tetap bersih dengan clang dan `__ANDROID_API__=24`. Perhatikan `<elf.h>`, `SYS_pread64`, `SYS_readlinkat`, dan `SYS_openat`.
+Catatan untuk Termux: kode ini belum pernah dikompilasi dengan Bionic. Yang perlu dicek adalah apakah `src/rootshim.c` tetap bersih dengan clang dan `__ANDROID_API__=24`. Perhatikan `<grp.h>`, `<pwd.h>`, `getline`, `SYS_fcntl`, `SYS_pread64`, `SYS_readlinkat`, dan `SYS_openat`.
 
 ## 2. Langkah
 
@@ -33,12 +34,13 @@ Gunakan `make -B` (bukan `make clean`) karena `tools/termux-check.sh` memakai `b
 - `make test`: rc=0, `summary failures=0`.
 - Suite Debian: harus `SKIP` (tidak ada glibc/dpkg). Salin baris SKIP persis.
 - `termux-check`: harus tetap PASS=6 FAIL=0 SKIP=0 ERROR=0, exit 0 seperti ronde 3. Jika ada FAIL pada hardlink, catat sebagai FAIL dengan bukti dan jangan mengubah klasifikasinya sendiri (lihat batasan).
-- Opsional, jika tersedia dan tidak butuh izin khusus: `printf 'echo ok\n' > $PREFIX/tmp/t.sh; chmod 755 $PREFIX/tmp/t.sh; sh -c '$PREFIX/tmp/t.sh'` harus mencetak `ok`. Ini memastikan exec biasa tidak rusak dengan shim terpasang.
+- Opsional, tanpa izin khusus: `printf 'echo ok\n' > $PREFIX/tmp/t.sh; chmod 755 $PREFIX/tmp/t.sh; sh -c '$PREFIX/tmp/t.sh'` harus mencetak `ok`. Ini memastikan exec biasa tidak rusak dengan shim terpasang.
+- Opsional: `id -u` dan `id -un` harus tetap berjalan tanpa error dengan shim terpasang (jalur NSS passthrough).
 
 ## 4. Format laporan balik
 
 ```
-Handoff round 5 — Termux regresi execve B2
+Handoff round 5 — Termux regresi shim rootfs-first
 Commit: <git rev-parse --short HEAD>
 Perangkat/Android: <uname -a; TERMUX_VERSION; __ANDROID_API__>
 Arsitektur: <uname -m>
@@ -50,6 +52,7 @@ suite debian rootfs: <baris SKIP/ok/FAIL persis>
 Ringkasan termux-check: PASS=<n> FAIL=<n> SKIP=<n> ERROR=<n>; exit=<n>
 note SKIP di termux-check: <ada/tidak; isi>
 opsional exec biasa: <ok / tidak dijalankan>
+opsional NSS passthrough: <ok / tidak dijalankan>
 
 Hal di luar dugaan:
 <tulis apa adanya>
@@ -60,6 +63,6 @@ Lampiran: build/termux-report.txt, build/make-all.log, build/make-test.log
 ## 5. Batasan yang harus dipahami
 
 - Suite Debian hanya berjalan di host glibc. Di Termux, `SKIP` adalah hasil yang benar.
-- Di host x86, suite ini masih punya 3 `KNOWN-LIMIT` (belum nol): NSS membaca `/etc/passwd` host, binary yang dimuat kernel memakai libc host, dan exec host-only yang membaca file lewat `open()`. Ketiganya bukan `FAIL`. Target nol KNOWN-LIMIT belum tercapai dan belum dikerjakan di sisi Termux.
+- Batas yang tersisa (README, "Hasil uji rootfs Debian"): ELF host di luar rootfs tetap melihat file lewat pemetaan rootfs; `execvp`, `posix_spawn`, dan inline asm belum dicegat; `getgrouplist`, `initgroups`, dan `getspnam` belum diinterposisi.
 - Kebijakan hardlink (hasil Android yang tidak bisa diperbaiki dicatat sebagai `SKIP` dengan bukti, bukan `FAIL`) **belum dikonfirmasi user**. Sampai dikonfirmasi, jangan mengubah klasifikasi tes hardlink. Laporkan apa adanya.
 - Jangan mengedit `src/`, `tests/`, `tools/`, `docs/`, atau `README.md`. Jangan `commit`, `push`, atau membuat branch. Jangan jalankan `su`, `sudo`, atau `unshare --map-root-user`.
