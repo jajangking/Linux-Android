@@ -1,6 +1,6 @@
 
 ===== Environment =====
-date: Thu Oct  8 15:57:03 WIB 2026
+date: Thu Oct  8 16:18:41 WIB 2026
 uname: Linux localhost 6.12.38-android16-5-gb575a0b6e647-ab14355190-4k #1 SMP PREEMPT Wed Oct 29 06:56:12 UTC 2025 aarch64 Android
 arch: aarch64
 PREFIX: /data/data/com.termux/files/usr
@@ -8,7 +8,7 @@ TERMUX_VERSION: 0.119.0-beta.3
 uid (real, via id): 10496
 compiler: clang -> clang version 21.1.8
 make: GNU Make 4.4.1
-git HEAD: arena/a4c2b8db-linux-android @ f6e3801
+git HEAD: arena/a4c2b8db-linux-android @ 0f14479
 Seccomp/NoNewPrivs of this shell:
   NoNewPrivs:	0
   Seccomp:	2
@@ -26,7 +26,7 @@ make: Leaving directory '/data/data/com.termux/files/home/Linux-Android'
 [PASS] make all
 
 ===== Step 2: make test (full suite) =====
-[FAIL] make test -- see build/termux-test.log
+[PASS] make test
 make: Entering directory '/data/data/com.termux/files/home/Linux-Android'
 sh tests/test-rootshim.sh
 cwd=/ uid=0 gid=0 st_uid=0 marker=from-rootfs
@@ -39,6 +39,7 @@ cwd=/ uid=0 gid=0 st_uid=0 marker=from-rootfs
 shell-marker=from-rootfs
 combined rootbox/shim smoke test: PASS
 sh tests/test-rootshim-hooks.sh
+host hard links: denied by host (checks will be SKIP)
 ok    open(flags runtime) via __open_2
 ok    openat(flags runtime) via __openat_2
 ok    mkdirat
@@ -51,12 +52,14 @@ ok    symlink
 ok    readlinkat
 ok    readlink
 ok    unlink
-FAIL  linkat (errno=Permission denied)
-FAIL  link (errno=No such file or directory)
-FAIL  renameat (errno=No such file or directory)
-FAIL  rename (errno=No such file or directory)
-FAIL  unlinkat (errno=No such file or directory)
-FAIL  unlink (hard link) (errno=No such file or directory)
+skip  linkat/link (host denies hard links; not a shim failure)
+ok    create file for rename checks
+ok    renameat
+ok    rename
+ok    unlinkat
+ok    raw syscall(SYS_renameat2) absolute path
+ok    raw syscall(SYS_unlinkat) absolute path
+ok    raw syscall(SYS_openat) absolute path
 ok    faccessat
 ok    access
 ok    fchmodat
@@ -70,6 +73,9 @@ ok    stat reports synthetic owner
 ok    getxattr
 ok    listxattr
 ok    removexattr
+ok    raw syscall(SYS_getuid/SYS_getgid) synthetic 0
+ok    raw syscall(SYS_newfstatat) synthetic owner
+ok    raw syscall(SYS_statx) synthetic owner
 ok    synthetic uid/gid are 0
 ok    getgroups lists synthetic group 0
 ok    '..' clamped at virtual root
@@ -78,10 +84,38 @@ ok    virtual root intact after failed chroot
 ok    chroot(dir)
 ok    virtual path visible after chroot(dir)
 ok    outer rootfs path hidden after chroot(dir)
-summary failures=6
-rootshim hook regression: 6 failing check(s)
-make: *** [Makefile:37: test] Error 1
+summary failures=0
+rootshim hook regression test: PASS
+sh tests/test-supervisor-groups.sh
+getgroups n=1 0
+egid=0
+rootbox getgroups consistency test: PASS
+sh tests/test-coreutils-shim.sh
+ok    cat
+ok    mkdir
+ok    mkdir landed in rootfs
+ok    cp
+ok    cp landed in rootfs
+ok    mv
+ok    mv renamed inside rootfs
+ok    ln
+ok    ln -s created symlink in rootfs
+ok    readlink
+ok    ls
+ok    stat-size
+ok    dd
+ok    dd wrote into rootfs
+ok    head
+ok    chmod
+ok    chmod changed rootfs file
+ok    truncate
+ok    truncate affected rootfs file
+ok    touch
+ok    rm
+ok    rm removed rootfs files
+coreutils under shim test: PASS
 make: Leaving directory '/data/data/com.termux/files/home/Linux-Android'
+note: at least one test reported SKIP (seccomp user notification unavailable here).
 
 ===== Step 3: repro chroot() on a regular file (fixed in round 2) =====
 chroot(/afile) rc=-1 errno=Not a directory
@@ -99,8 +133,8 @@ ok    mkdir
 ok    mkdir landed in rootfs
 ok    cp
 ok    cp landed in rootfs
-FAIL  mv (mv: cannot move '/rsh-coreutils/copy' to '/rsh-coreutils/moved': No such file or directory)
-FAIL  mv renamed inside rootfs
+ok    mv
+ok    mv renamed inside rootfs
 ok    ln
 ok    ln -s created symlink in rootfs
 ok    readlink
@@ -109,15 +143,15 @@ ok    stat-size
 ok    dd
 ok    dd wrote into rootfs
 ok    head
-FAIL  chmod (chmod: cannot access '/rsh-coreutils/moved': No such file or directory)
-FAIL  chmod changed rootfs file
+ok    chmod
+ok    chmod changed rootfs file
 ok    truncate
 ok    truncate affected rootfs file
 ok    touch
-FAIL  rm (rm: cannot remove '/rsh-coreutils/moved': No such file or directory)
+ok    rm
 ok    rm removed rootfs files
-coreutils under shim: 5 failing check(s)
-[FAIL] coreutils leak or failure -- see output above
+coreutils under shim test: PASS
+[PASS] coreutils file operations stay inside rootfs
 
 ===== Step 6: Termux probe (tools/probe-termux.sh) =====
 == Termux / Android probe ==
@@ -142,6 +176,6 @@ probe complete
 [PASS] probe-termux.sh ran to completion
 
 ===== Summary =====
-PASS=4 FAIL=2 SKIP=0 ERROR=0
+PASS=6 FAIL=0 SKIP=0 ERROR=0
 Report: /data/data/com.termux/files/home/Linux-Android/build/termux-report.txt
 Attach this file (build/termux-report.txt) when handing results back.

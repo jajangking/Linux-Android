@@ -1,302 +1,232 @@
-# ARENA-REPLY — balasan untuk arena.ai (ronde 2)
+# ARENA-REPLY — balasan untuk arena.ai (ronde 3)
 
 **Kepada:** arena.ai (batch `a4c2b8db-linux-android`)
 **Dari:** jajangking (verifikasi di perangkat nyata)
-**Tanggal:** 2026-10-08 | Branch: `arena/a4c2b8db-linux-android` (`f6e3801`)
+**Tanggal:** 2026-10-08 | Branch: `arena/a4c2b8db-linux-android` (`0f14479`)
 
-Handoff ronde 2 (`docs/HANDOFF-termux.md`) sudah dijalankan di Termux (arm64, Bionic,
-Android 16). Runner, repro, dan seluruh tes baru bekerja apa adanya. Tidak ada file di
-`src/`, `tests/`, `tools/`, `docs/`, atau `README.md` yang saya sentuh — sesuai §5 handoff.
+Handoff ronde 3 (`docs/HANDOFF-termux.md`) sudah dijalankan di Termux (arm64, Bionic,
+Android 16, `__ANDROID_API__ = 24`). Tidak ada file di `src/`, `tests/`, `tools/`,
+`docs/`, atau `README.md` yang saya sentuh — sesuai §5 handoff.
 
-> Balasan ronde 1 ada di commit `d3bfe3d`. Isinya: verifikasi `PASS=2 FAIL=1 KNOWN-BUG=2`, akar-cause
-> `test-rootbox-combined.sh`, temuan `__open_2`/`__openat_2`,
-> dan temuan `getgroups` di lapisan shim. Ketiganya sudah diperbaiki di `f6e3801` dan
-> saya konfirmasi closing-nya di bawah.
+> Riwayat balasan: ronde 1 = `d3bfe3d`, ronde 2 = `5fa7c8f` (keduanya sudah tersimpan di
+> branch ini).
 
 ```
-Commit: f6e3801
+Commit: 0f14479
 uname:  Linux localhost 6.12.38-android16-5-gb575a0b6e647-ab14355190-4k #1 SMP PREEMPT
         Wed Oct 29 06:56:12 UTC 2025 aarch64 Android
         TERMUX_VERSION: 0.119.0-beta.3   __ANDROID_API__ = 24
         PREFIX: /data/data/com.termux/files/usr   uid (nyata): 10496
 clang version 21.1.8   GNU Make 4.4.1
 
-Ringkasan termux-check: PASS=4 FAIL=2 SKIP=0 ERROR=0
+Ringkasan termux-check: PASS=6 FAIL=0 SKIP=0 ERROR=0     exit=0
 ```
+
+**Hijau penuh.** `make test` untuk pertama kalinya keluar `rc=0` dengan `summary failures=0`.
 
 | Langkah | Hasil |
 |---|---|
 | `make all` (clang, `-Wall -Wextra`) | **PASS** — 0 warning |
-| `make test` | **FAIL** — `tests/test-rootshim-hooks.sh` |
-| chroot() repro | **PASS** — sudah diperbaiki |
-| getgroups() repro di rootbox | **PASS** — sudah diperbaiki |
-| coreutils di bawah shim | **FAIL** — `mv` |
-| rootshim-hooks | **FAIL** — 6 check |
+| `make test` | **PASS** — `failures=0`, 2 check `skip` |
+| chroot() repro | **PASS** |
+| getgroups() repro di rootbox | **PASS** — `getgroups n=1 0`, rc=0 |
+| coreutils di bawah shim | **PASS** — termasuk `mv` path absolut |
+| rootshim-hooks | **PASS** — 0 `FAIL`, 2 `skip` |
 | probe-termux.sh | **PASS** |
 
 Laporan mentah: `build/termux-report.txt`.
 
 ---
 
-## 1. Kedua bug ronde 1: tertutup, keduanya terverifikasi di Bionic
+## 1. Ketiga temuan ronde 2 tertutup — dan hipotesis `mv`-nya benar
 
-**`chroot()`** — `tests/repro/chroot_file.c` sekarang `PASS`:
+### 1.1 `mv`: hipotesis `syscall()` **terkonfirmasi**
 
-```
-chroot(/afile) rc=-1 errno=Not a directory
-open(/etc/marker) after failed chroot: fd=3 errno=ok
-[PASS] failed chroot() leaves virtual root intact
-```
-
-**`getgroups()`** — `tests/repro/getgroups.c` sekarang `PASS`, **`rc=0`**, bukan `FAIL`
-exit 4. Artinya **`process_vm_writev` diizinkan di perangkat ini**:
+Inilah jawaban untuk pertanyaan §7 Anda yang paling penting. `readelf -W` (§4a):
 
 ```
-build/rootbox -- build/repro-getgroups
-getgroups n=1 0
-egid=0
-rc=0
+152: 0000000000000000     0 FUNC    GLOBAL DEFAULT  UND renameat@LIBC
+377: 0000000000000000     0 FUNC    GLOBAL DEFAULT  UND syscall@LIBC
 ```
 
-Ini menjawab pertanyaan §7 Anda yang paling penting: iya, `repro-getgroups` lulus di
-rootbox, dan tidak perlu fallback apa pun.
+`mv` memang mengimpor `syscall@LIBC`. Itu sebabnya **seluruh** interposer yang saya pasang
+di ronde 2 tidak pernah terpicu — `mv` masuk lewat `syscall()`, bukan lewat PLT
+`renameat`. Bukti negatif yang saya laporkan di ronde 2 justru mengarah tepat ke titik ini.
 
-**`test-rootbox-combined.sh`** juga hijau — usulan probe terkompilasi saya diterima:
-
-```
-cwd=/ uid=0 gid=0 st_uid=0 marker=from-rootfs
-shell-marker=from-rootfs
-combined rootbox/shim smoke test: PASS
-```
-
-**`rootshim-hooks` lulus di Bionic** untuk jalur fortify yang Anda maksud:
+Hasil langsung (§4e):
 
 ```
-ok    open(flags runtime) via __open_2
-ok    openat(flags runtime) via __openat_2
-ok    getgroups lists synthetic group 0
-ok    chroot(file) fails ENOTDIR
-ok    virtual root intact after failed chroot
-ok    '..' clamped at virtual root
+mv rc=0
+isi rsh-m: moved
 ```
 
-Yaitu simbol `__open_2`/`__openat_2` benar-benar diuji dan benar-benar bekerja di
-arm64/Bionic. Peningkatan dari "semua GNU coreutils bocor" (ronde 1) ke "hanya `mv` yang bocor"
-adalah progres nyata.
+Dan di `make test`:
+
+```
+ok    mv
+ok    mv renamed inside rootfs
+coreutils under shim test: PASS
+```
+
+### 1.2 Hard link: `SKIP`, bukan `FAIL`
+
+```
+host hard links: denied by host (checks will be SKIP)
+skip  linkat/link (host denies hard links; not a shim failure)
+```
+
+Persis yang saya minta di ronde 2 §2: penolakan platform dilaporkan `SKIP`, bukan
+`FAIL`. Probe dijalankan di host tanpa shim, jadi benar-benar mengukur kemampuan
+platform dan bukan kemampuan shim. `rename`/`unlink` juga dipisah ke file sendiri
+sehingga tidak ikut jadi cascade — dan keduanya hijau:
+
+```
+ok    create file for rename checks
+ok    renameat
+ok    rename
+ok    unlinkat
+```
+
+### 1.3 `statx`: keputusan API 24 sudah tertutup
+
+Wrapper `statx()` memang tetap tidak ada di Termux (`nm -D` tidak mengacaknya), tapi
+jalur mentahnya sekarang dipetakan. Check baru hijau:
+
+```
+ok    raw syscall(SYS_renameat2) absolute path
+ok    raw syscall(SYS_unlinkat) absolute path
+ok    raw syscall(SYS_openat) absolute path
+ok    raw syscall(SYS_getuid/SYS_getgid) synthetic 0
+ok    raw syscall(SYS_newfstatat) synthetic owner
+ok    raw syscall(SYS_statx) synthetic owner
+```
+
+`raw syscall(SYS_statx) synthetic owner` **ok** justru tanpa wrapper `statx` — itu
+konsekuensi keputusan API 24 yang tertutup dengan rapi, dan saya setuju dengan
+keputusan itu.
 
 ---
 
-## 2. `FAIL` #1: `linkat` EACCES — restriksi Android, **bukan** bug shim
+## 2. Pemeriksaan tambahan (bagian 4)
 
-6 check `rootshim-hooks` gagal, tapi hanya **1 akar**:
-
-```
-FAIL  linkat (errno=Permission denied)                    <-- akar
-FAIL  link        (errno=No such file or directory)         \
-FAIL  renameat    (errno=No such file or directory)          |
-FAIL  rename      (errno=No such file or directory)          > 5 cascade:
-FAIL  unlinkat    (errno=No such file or directory)          | hardlink tidak
-FAIL  unlink (hard link) (errno=No such file or directory)  /  pernah dibuat
-summary failures=6
-```
-
-Bukti bahwa ini restriksi platform dan bukan shim — program C polos, **tanpa
-`LD_PRELOAD` sama sekali**:
+**(a) `mv` mengimpor syscall/renameat2** — ya:
 
 ```
-$ ./hl $d/f $d/h
-linkat(...) = -1 errno=Permission denied
+152: UND renameat@LIBC
+377: UND syscall@LIBC
 ```
 
-Hook `linkat`/`link` sendiri benar. Saya uji terpisah dengan file sumber yang benar:
+**(b) Simbol shim** — ada semua yang diharapkan:
 
 ```
-renameat (independent)   rc=0   ok
-rename (independent)     rc=0   ok
-unlinkat (independent)   rc=0   ok
-unlink (independent)     rc=0   ok
-linkat  <-- akar         rc=-1  Permission denied
+T __open_2    T faccessat2    T getgroups    T renameat2    T syscall
 ```
 
-Empat operasi pertama benar-benar mendarat di dalam rootfs (dicek langsung dari host).
-Jadi 5 kegagalan lain **100% cascade**.
+`statx` tidak ada, sesuai yang Anda nyatakan (hanya bila API ≥ 30; Termux di sini 24).
 
-### Masalahnya adalah klasifikasi status
+**(c) Probe hard link host** — `DENIED` (`Permission denied`).
 
-`termux-check.sh` melaporkannya `FAIL` — artinya "regresi, prioritas tinggi". Padahal
-handoff Anda sendiri punya kategori `SKIP` untuk tepat kasus ini: *"fitur kernel/Android
-tidak tersedia"*. Akibatnya **`make test` tidak akan pernah hijau di Termux**, dan setiap
-ronde berikutnya akan melaporkan regresi palsu yang sama.
+**(d) Warning** — **0**, di `build/round3-build.log` maupun `build/round3-test.log`,
+termasuk dari interposer `syscall` maupun `fake_raw_stat`. Ini menjawab pertanyaan §7
+terakhir: interposer `syscall` bersih di clang Termux.
 
-**Saran fix:** probe kemampuan hardlink sekali di awal `tests/rootshim_hooks.c`. Kalau
-`linkat` mengembalikan `EACCES`/`EPERM`, laporkan 6 check itu sebagai `skip` dan jangan
-tambah ke `failures`. Pola ini sudah dipakai di file yang sama untuk xattr `ENOTSUP`
-(baris 112), jadi cukup konsisten dengan gaya yang sudah ada.
-
-Catatan: ini hasil yang sama seperti temuan "kontrol ilmiah" di proyek `Brainstorming`
-— `linkat` dengan `AT_EMPTY_PATH` butuh `CAP_DAC_READ_SEARCH` dan gagal di Android.
-Hard link **`flags=0`** pun gagal di sini, jadi restriksinya lebih luas dari yang biasa
-ditemukan.
+**(e) `mv` langsung** — `rc=0`; isi `rsh-m/`: `moved`.
 
 ---
 
-## 3. `FAIL` #2: `mv` bocor — dan ini batas innate shim, bukan hook yang hilang
+## 3. Sanity sweep tambahan (di luar handoff)
 
-5 check coreutils gagal, 1 akar:
+Meng-intersep `syscall()` itu berisiko tinggi: `syscall()` adalah satu-satunya syscall
+entry point universal di libc, dan salah handling-nya bisa merusak `futex`, `gettid`, atau
+propagasi exit code. Karena itu saya uji sendiri, bukan hanya menerima `make test`:
 
-```
-FAIL  mv (cannot move '/rsh-coreutils/copy' to '/rsh-coreutils/moved')
-FAIL  mv renamed inside rootfs         \
-FAIL  chmod (cannot access .../moved)    > 4 cascade: file tidak pernah
-FAIL  chmod changed rootfs file        /  dipindahkan
-FAIL  rm (cannot remove .../moved)
-```
-
-Hook `rename`/`renameat` **bukan** penyebabnya: keduanya `ok` di `rootshim-hooks`, dan
-`mv` dengan path host yang sudah berada di dalam rootfs juga berhasil (`rc=0`).
-
-Hasil pengujian yang saya lakukan:
-
-| Skenario | Hasil |
+| Yang diuji | Hasil |
 |---|---|
-| `mv /c/copy /c/moved` (path absolut virtual) | **gagal** |
-| `mv copy moved` setelah `cd /c` (path relatif) | **berhasil**, file mendarat di rootfs |
+| `grep sed wc sort find tee` di bawah shim (path absolut) | rc=0 semua |
+| `/proc/self/status`, `/dev/urandom` | passthrough ok |
+| pipe dan subshell `$(...)` | ok |
+| propagasi exit code (`exit 42`) | `rc=42`, benar |
+| 5 skrip `make test` | hijau |
 
-`mv` aman kalau **kernel** yang me-resolve path — dari cwd yang sudah dipetakan `chdir`
-milik shim. Gagal kalau `mv` sendiri harus me-resolve path absolut.
-
-### Simbol yang dipakai `mv`: belum ketemu
-
-Saya pasang interposer untuk `rename`, `renameat`, `renameat2`, `symlinkat`, `statx`,
-`stat`, `lstat`, `fstatat`, `openat`, `__open_2`, `__openat_2`, `unlink`, `unlinkat`,
-`link`, `linkat`, `faccessat`, `symlink` — **nol** yang terpicu saat `mv` berjalan.
-
-Lalu saya pasang *blocker* yang memaksa `rename`/`renameat`/`renameat2` mengembalikan
-`0` tanpa melakukan apa pun. Blocker **tidak pernah** terpicu, dan `mv` tetap gagal di
-path virtual. Jadi bisa disimpulkan `mv` tidak pernah menyentuh ketiga simbol itu.
-
-Perbandingan dengan tool lain dari binary `coreutils` yang **sama**:
-
-| tool | jejak interposeable |
-|---|---|
-| `ls` | 15 |
-| `cp` | 3 |
-| `rm` | 2 |
-| `cat` | 2 |
-| **`mv`** | **0** |
-| `ln -s` | 0 — tapi **lulus** di tes, karena `ln` lewat `symlinkat` yang sudah di-hook |
-
-`ln -s` nol jejak tapi tetap benar adalah bukti bahwa "nol jejak" tidak otomatis berarti
-bocor: yang menentukan adalah apakah path-nya jatuh ke kernel atau tidak. Pada `mv`,
-pathnya jatuh ke kernel apa adanya.
-
-`strace` tidak tersedia di Termux, jadi saya tidak bisa melihat syscall mentahnya. Saya
-**tidak** mengklaim tahu penyebabnya, dan saya sengaja tidak menebak.
-
-**Saran:** ini yang paling berharga untuk ronde 3. Bukan karena `mv` penting, tapi karena
-pola "satu binary coreutils, sebagian operasi lolos PLT dan sebagian tidak" menentukan
-seberapa luas batas innate shim ini. README sudah menyatakan `execve` tidak dipetakan;
-`mv` memberi contoh nyata bahwa daftar itu belum lengkap.
-
-Kalau memang kesimpulannya "diterima sebagai limitasi innate", saya tetap menyarankan
-dokumentasikan eksplisit di README, dengan contoh yang bisa direproduksi, supaya tidak
-ditemukan sebagai kejutan di ronde berikutnya.
+Tidak ada regresi. Syscall non-path diteruskan dengan benar.
 
 ---
 
-## 4. `statx` hook dikompilasi keluar di Termux — tanpa warning
+## 4. Satu temuan: catatan runner yang salah attribut
 
 ```
-$ nm -D build/librootshim.so | grep -ci statx
-0
+[PASS] make test
+note: at least one test reported SKIP (seccomp user notification unavailable here).
 ```
 
-Penyebabnya guard di `src/rootshim.c:431`:
+**Note itu salah.** Sumbernya `tools/termux-check.sh:65` — `grep -q 'SKIP'` pada test log.
+Satu-satunya `SKIP` di log tersebut adalah hard link yang ditolak host:
 
-```c
-#if defined(__GLIBC__) || (defined(__ANDROID_API__) && __ANDROID_API__ >= 30)
+```
+12: host hard links: denied by host (checks will be SKIP)
+25: skip  linkat/link (host denies hard links; not a shim failure)
 ```
 
-Di Termux ini `__ANDROID_API__ = 24` (saya verifikasi lewat preprocessor, bukan tebakan),
-jadi cabangnya mati. Ini **sesuai aturan yang Anda tulis sendiri** di handoff §1
-("`statx` hanya jika API>=30") dan tidak menghasilkan warning — tapi konsekuensinya tidak
-tercatat di mana pun:
+Laporan ini **kontradiksi sendiri**: 12 baris di bawahnya, Step 4 `rootbox` **PASS**
+dengan `getgroups n=1 0`, dan `probe-termux.sh` mencetak `uid=0(root)` +
+`seccomp supervisor child exit: 0`. Seccomp user-notification jelas **aktif**.
 
-- Setiap program yang memanggil `statx()` langsung bocor dari shim.
-- Untuk target Debian/glibc ke depan, `statx` justru jalur yang **paling sering** dipakai
-  program modern. Jadi kondisi sekarang menunda masalah, bukan menyelesaikannya.
+Dampaknya nyata, bukan teoritis: operator yang membaca laporan ini bisa menyimpulkan
+`rootbox` tidak berfungsi di perangkat ini — padahal justru sebaliknya. Dan karena note
+itu muncul pada setiap ronde ke depan selama `SKIP` masih ada, ia akan terus menyesatkan.
 
-**Saran:** turunkan ambangnya ke `>= 24` untuk Bionic — header-nya sudah menyediakan
-`struct statx` — atau minimal catat di README bahwa shim tidak meng-map `statx` di Termux.
+Ini kelas kesalahan yang sama dengan temuan ronde 2 §2, hanya arahnya terbalik. Waktu itu
+platform ditolak dilaporkan `FAIL` (terlalu yakin); sekarang platform ditolak disalahkan
+ke seccomp (terlalu ragu). Keduanya berasal dari satu keputusan yang sama: `SKIP` tidak
+pernah dipisahkan menurut asalnya.
 
-Ini menjawab pertanyaan §7 terakhir Anda: **tidak ada warning** dari deklarasi `statx`,
-`renameat2`, atau `faccessat2`. Ketiganya bersih. Tapi `statx` justru yang hilang.
+**Saran:** pisahkan `SKIP` menurut sumber sebelum mencetak note — mis. hanya cetak note
+seccomp kalau yang `SKIP` memang berasal dari `rootbox`/seccomp, dan cetak note hard-link
+kalau yang `SKIP` berasal dari `skip linkat/link`. Kalau tidak mau diubah, lebih aman
+**menghapus note itu** sekarang: isinya tidak membawa informasi baru lagi.
 
----
-
-## 5. Hasil pemeriksaan tambahan (§4)
-
-**a) Simbol yang diekspor shim** — `__open_2`, `__open64_2`, `__openat_2`,
-`__openat64_2`, `faccessat2`, `getgroups`, `renameat2` **semua ada**. `statx` tidak ada
-(lihat bagian `statx` di atas).
-
-**b) coreutils mengimpor entry point fortify** — ya: `__open_2`, `__openat_2`.
-
-**c) Warning kompilasi** — **0**, baik `build/round2-build.log` maupun
-`build/round2-test.log`.
-
-**d) `rootbox -- build/repro-getgroups`** — `getgroups n=1 0`, `egid=0`, **rc=0**.
-
-**e) `ptrace_scope`** — `yama: not present`. Android memang tidak memakai Yama;
-`process_vm_writev` tetap berfungsi (lihat (d)).
+Prioritas rendah, karena tidak memengaruhi exit code maupun status check mana pun.
 
 ---
 
-## 6. Yang membaik dari ronde 1
+## 5. Yang tidak bisa diverifikasi (jujur)
 
-- `Seccomp`/`NoNewPrivs` kini tampil di terminal, bukan hanya di file laporan.
-- Shim mengekspor `getgroups` — GID host tidak lagi bocor ke "root" virtual saat shim
-  dipakai tanpa rootbox.
-- `chroot()` tidak lagi merusak virtual root saat gagal.
-- `test-rootbox-combined.sh` tidak lagi bergantung `PATH` host.
-- `execve` sengaja tidak dipetakan — sesuai instruksi, saya tidak menghitungnya regresi.
-
----
-
-## 7. Yang TIDAK bisa diverifikasi (jujur)
-
-- **Tidak ada `strace`** di Termux, jadi mekanisme `mv` (§3) tidak bisa saya buktikan.
-  Yang saya punya hanya bukti negatif: tidak ada satu pun interposer saya yang terpicu.
-- **`unshare --map-root-user` tetap tidak dicoba**, sesuai §5 handoff. Jadi klaim README
-  bahwa user-namespace tidak tersedia belum terverifikasi runner — hanya
-  `--map-current-user` (`Invalid argument`) yang dicoba.
-- **Tidak ada rootfs Debian nyata.** Semua verifikasi memakai rootfs minimal buatan tes.
-  Interaksi dengan rootfs bercabang (symlink melintas, device node, `PT_INTERP`, glibc)
-  **tidak** tersentuh sama sekali.
-- **Tidak ada CI.** Semua hasil berasal dari satu perangkat arm64; perilaku x86_64 yang
+- **Tidak ada `strace`.** Jadi interposer `syscall()` hanya saya uji lewat program yang
+  memanggil `syscall(SYS_*)` langsung (milik `rootshim-hooks`), bukan lewat observasi
+  syscall mentah program nyata seperti `mv`. Mekanisme `mv` saya buktikan lewat `readelf`
+  dan hasil fungsional, bukan lewat syscall trace.
+- **Tidak ada rootfs Debian nyata.** Semua verifikasi tetap memakai rootfs minimal buatan
+  tes. Interaksi dengan glibc, `PT_INTERP`, device node, dan rootfs bercabang **belum
+  tersentuh sama sekali** — dan justru ini yang paling dekat dengan target akhir proyek.
+- **`unshare --map-root-user` tidak dicoba**, sesuai §5 handoff. Klaim README bahwa
+  user-namespace tidak tersedia belum terverifikasi runner; hanya `--map-current-user`
+  (`Invalid argument`) yang diuji.
+- **Tidak ada CI.** Semua hasil berasal dari satu perangkat arm64. Perilaku x86_64 yang
   jadi asal verifikasi Anda belum dikonfirmasi ulang di sini.
 
 ---
 
-## 8. Untuk arena.ai kalau dipanggil lagi
+## 6. Untuk arena.ai kalau dipanggil lagi
 
-Ronde 2 menutup semua item ronde 1. Yang tersisa bukan bug, tapi tiga keputusan sadar
-yang memang tidak mudah:
+Tidak ada lagi item terbuka dari handoff ronde 3. Ketiga temuan ronde 2 tertutup, dan
+`make test` hijau untuk pertama kalinya dengan `FAIL=0` di perangkat saya.
 
-1. **`linkat` → `SKIP`** (paling mendesak). Tanpa ini `make test` tidak akan pernah hijau
-   di Termux dan setiap ronde melaporkan regresi palsu.
-2. **`statx` di API 24** atau didokumentasikan sebagai tidak dipetakan.
-3. **`mv`** — dokumentasikan sebagai limitasi innate yang terbukti, idealnya dengan contoh
-   reproduksi yang sudah saya siapkan (§3).
+Kalau ada kontribusi lanjutan, yang menurut saya paling bernilai:
 
-Tidak ada lagi item yang menunggu dari handoff ronde 2. Kalau ada kontribusi lanjutan, yang
-bernilai paling tinggi menurut saya adalah **membedah `mv`** — kalau ternyata penyebabnya
-mekanisme umum yang juga memengaruhi program lain, itu temuan struktural; kalau ternyata
-khusus `mv`, kita setidaknya punya bukti dan batas yang jelas.
+1. **Rootfs Debian nyata.** Semua yang kita kerjakan selama tiga ronde berhenti di rootfs
+   minimal. Batas paling besar dari proyek ini bukan hooking, melainkan fakta bahwa belum
+   ada satu pun program Debian asli yang pernah diuji. Hook `statx` dan `syscall()` yang
+   baru dibuat justru paling relevan justru di sana — dan belum pernah diuji di sana.
+2. **Pisahkan asal `SKIP` di `termux-check.sh`** (§4 di atas) sebelum ronde berikutnya,
+   supaya catatan tidak ikut menyesatkan lagi.
+3. **CI.** Satu job `clang` di x86_64 + satu di arm64 akan menghemat waktu yang paling
+   murah untuk semua ronde berikutnya, karena sekarang verifikasi hanya bisa dilakukan di
+   satu perangkat.
 
 Regresi wajib tetap: `make all` (0 warning), `make test`, `tests/repro/chroot_file.c`,
-`tests/repro/getgroups.c`, `tests/rootshim_hooks.c`, `tests/test-coreutils-shim.sh`,
-`tools/termux-check.sh`, `tools/probe-termux.sh`. `make test` harus hijau di Termux
-setelah butir 1 dikerjakan, dan `termux-check.sh` harus keluar `exit=0`.
+`tests/repro/getgroups.c`, `tests/rootshim_hooks.c`,
+`tests/test-coreutils-shim.sh`, `tests/test-supervisor-groups.sh`,
+`tools/termux-check.sh`, `tools/probe-termux.sh`. Di Termux, kondisi sekarang adalah
+`make test` rc=0 dan `termux-check.sh` exit=0 — jadikan itu titik regresi.
 
 — jajangking
